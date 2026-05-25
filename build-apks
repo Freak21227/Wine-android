@@ -1,0 +1,254 @@
+#!/bin/sh
+#
+# Build Android packages
+#
+# Copyright 2018 Alexandre Julliard
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public
+# License as published by the Free Software Foundation; either
+# version 2.1 of the License, or (at your option) any later version.
+#
+# This library is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public
+# License along with this library; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+#
+
+set -e
+
+basedir=$HOME/wine/packages/android
+winetree=https://gitlab.winehq.org/wine/wine.git
+android_root=$HOME/android
+android_api=26
+default_path=/usr/lib/ccache:$HOME/bin:/usr/sbin:/sbin:/usr/bin:/bin:$android_root/tools:$android_root/platform-tools
+downloads=$HOME/.cache/wine-packaging
+winetools=$basedir/tools
+silent=
+makeflags="--no-print-directory -j$(nproc)"
+
+android_ndk=android-ndk-r28c
+gradle=gradle-9.4.0
+android_sdk=android-sdk
+cmdline_tools=commandlinetools-linux-7583922_latest.zip
+build_tools=36.0.0
+sdk_api=36
+llvm_mingw=llvm-mingw-20250514-ucrt-ubuntu-22.04-x86_64
+freetype=freetype-2.13.3
+gmp=gmp-6.3.0
+nettle=nettle-3.10.2
+gnutls=gnutls-3.8.9
+openldap=openldap-2.6.10
+cups=cups-2.4.12
+gecko=wine-gecko-2.47.4
+
+sourcedir=$(cd $(dirname $0) && pwd)
+release=$1
+
+download ()
+{
+    test -d $downloads || mkdir -p $downloads
+    test -f $downloads/$(basename $2) || wget -O $downloads/$(basename $2) ${3:-$2}
+    rm -rf $1
+    case $2 in
+        *.zip)
+            unzip -q $downloads/$(basename $2) ;;
+        *)
+            tar xf $downloads/$(basename $2) ;;
+    esac
+}
+
+config_ndk ()
+{
+    download $android_ndk https://dl.google.com/android/repository/$android_ndk-linux.zip
+}
+
+config_toolchain ()
+{
+    ndkbin=../$android_ndk/toolchains/llvm/prebuilt/linux-x86_64/bin
+    test -x $ndkbin/${clang_prefix}${android_api}-clang
+}
+
+config_gradle ()
+{
+    download $gradle $gradle-bin.zip https://services.gradle.org/distributions/$gradle-bin.zip
+}
+
+config_android_sdk ()
+{
+    mkdir -p $android_sdk
+    test -f $downloads/$cmdline_tools || wget -O $downloads/$cmdline_tools https://dl.google.com/android/repository/$cmdline_tools
+    unzip -n $downloads/$cmdline_tools -d $android_sdk
+    yes | $android_sdk/cmdline-tools/bin/sdkmanager --sdk_root=$(pwd)/$android_sdk --licenses >/dev/null || true
+    $android_sdk/cmdline-tools/bin/sdkmanager --sdk_root=$(pwd)/$android_sdk --install "platforms;android-$sdk_api" "build-tools;$build_tools"
+}
+
+config_llvm_mingw ()
+{
+    download $llvm_mingw https://github.com/mstorsjo/llvm-mingw/releases/download/20250514/$llvm_mingw.tar.xz
+}
+
+config_freetype ()
+{
+    download $freetype http://download.savannah.gnu.org/releases/freetype/$freetype.tar.xz
+    (cd $freetype && $run_configure --without-png && make $makeflags)
+}
+
+config_gmp ()
+{
+    download $gmp https://ftp.gnu.org/gnu/gmp/$gmp.tar.xz
+    (cd $gmp && $run_configure --disable-static && make $makeflags)
+}
+
+config_nettle ()
+{
+    test -d $gmp || config_gmp
+    download $nettle https://ftp.gnu.org/gnu/nettle/$nettle.tar.gz
+    gmpdir=$(pwd)/$gmp
+    (cd $nettle && $run_configure --disable-shared --disable-documentation --with-lib-path=$gmpdir/.libs CPPFLAGS=-I$gmpdir && make $makeflags)
+}
+
+config_gnutls ()
+{
+    test -d $nettle || config_nettle
+    version=v$(expr $gnutls : '.*-\([0-9]\+\.[0-9]\+\)')
+    download $gnutls https://www.gnupg.org/ftp/gcrypt/gnutls/$version/$gnutls.tar.xz
+    gmpdir=$(pwd)/$gmp
+    nettledir=$(pwd)/$nettle
+    test -e $nettle/nettle || ln -s . $nettle/nettle  # gnutls includes nettle files with nettle/ prefix
+    (cd $gnutls && ./configure --host=$host --without-p11-kit --without-idn --without-brotli --without-zstd --without-tpm --without-tpm2 --with-included-libtasn1 --with-included-unistring -disable-cxx \
+                               --disable-maintainer-mode --disable-static --disable-doc --disable-tools --disable-tests \
+                               CC=$CC PKG_CONFIG=true \
+                               GMP_CFLAGS="-I$gmpdir -L$gmpdir/.libs -lgmp" GMP_LIBS=$gmpdir/.libs/libgmp.so \
+	                       NETTLE_CFLAGS=-I$nettledir NETTLE_LIBS="-L$nettledir -lnettle" \
+	                       HOGWEED_CFLAGS=-I$nettledir HOGWEED_LIBS="-L$nettledir -lhogweed -lnettle $gmpdir/.libs/libgmp.so" \
+         && make $makeflags)
+}
+
+config_openldap ()
+{
+    download $openldap https://www.openldap.org/software/download/OpenLDAP/openldap-release/$openldap.tgz
+    cp $gnutls/build-aux/ltmain.sh $gnutls/build-aux/config.guess $gnutls/build-aux/config.sub $openldap/build
+    grep -q '#include <wchar.h>' $openldap/libraries/libldap/utf-8-conv.c || sed -i '1i#include <wchar.h>' $openldap/libraries/libldap/utf-8-conv.c
+    (cd $openldap && autoreconf -fi && $run_configure --with-yielding_select=yes --disable-bdb --disable-hdb ac_cv_func_memcmp_working=yes CPPFLAGS="-DANDROID -DHAVE_WCHAR_H=1" LDFLAGS="-Wl,--undefined-version" CC=$CC && make $makeflags)
+}
+
+config_cups ()
+{
+    version=v$(expr $cups : '.*-\([0-9.]\+\)$')
+    download $cups $cups-source.tar.gz https://github.com/OpenPrinting/cups/releases/download/$version/$cups-source.tar.gz
+    patch -d $cups -p1 -s < $sourcedir/cups.diff
+    gnutlsdir=$(pwd)/$gnutls
+    nettledir=$(pwd)/$nettle
+    gmpdir=$(pwd)/$gmp
+    (cd $cups && $run_configure --disable-gssapi --with-tls=gnutls PKGCONFIG=/bin/false \
+        GNUTLS_CFLAGS="-I$gnutlsdir/lib/includes" \
+        GNUTLS_LIBS="-L$gnutlsdir/lib/.libs -lgnutls -L$nettledir -lhogweed -lnettle -L$gmpdir/.libs -lgmp -lz" \
+        && cd cups && make $makeflags libs)
+}
+
+config_wine_tools ()
+{
+    mkdir tools
+    (cd tools && ../wine/configure --without-x --enable-win64 && make $makeflags __tooldeps__ nls/all)
+}
+
+config_wine ()
+{
+    test -d toolchain || config_toolchain
+    test -d $freetype || config_freetype
+    test -d $gmp || config_gmp
+    test -d $nettle || config_nettle
+    test -d $gnutls || config_gnutls
+    test -d $openldap || config_openldap
+    test -d $cups || config_cups
+    rm -rf wine
+    mkdir wine
+    (cd wine && ../../wine/configure --host=$host --with-wine-tools=../../tools CC=$CC \
+                CFLAGS="$target_cflags -fPIC" \
+                FREETYPE_CFLAGS="-I../$freetype/include" \
+                FREETYPE_LIBS="-L../$freetype/objs/.libs -lfreetype" \
+                GNUTLS_CFLAGS="-I../$gnutls/lib/includes" \
+                GNUTLS_LIBS="-L../$gnutls/lib/.libs -lgnutls -L../$nettle -lhogweed -lnettle -L../$gmp/.libs -lgmp -lz" \
+                LDAP_CFLAGS="-I../$openldap/include" \
+                LDAP_LIBS="-L../$openldap/libraries/liblber/.libs -L../$openldap/libraries/libldap/.libs -lldap -llber" \
+                CUPS_CFLAGS="-I../$cups" \
+                CUPS_LIBS="-L../$cups/cups -lcups -L../$gnutls/lib/.libs -lgnutls -L../$nettle -lhogweed -lnettle -L../$gmp/.libs -lgmp -lz" \
+                GRADLE=$basedir/$gradle/bin/gradle \
+                ANDROID_HOME=$basedir/$android_sdk \
+                ac_cv_func_getrandom=no)
+}
+
+build_all ()
+{
+    test -d wine || config_wine
+    (cd wine && make $makeflags all)
+}
+
+install_all ()
+{
+    test -d wine || config_wine
+    cd wine
+    destdir=$(pwd)/dlls/wineandroid.drv
+    make $makeflags all
+    rm -rf $destdir/assets $destdir/lib $destdir/build $destdir/wine-debug.apk
+    mkdir -p $destdir/assets $destdir/lib/$exec_prefix
+    make install-lib prefix= DESTDIR=dlls/wineandroid.drv/assets STRIP=true
+    for i in \
+        ../$freetype/objs/.libs/libfreetype.so \
+        ../$gmp/.libs/libgmp.so \
+        ../$gnutls/lib/.libs/libgnutls.so \
+        ../$openldap/libraries/liblber/.libs/liblber.so \
+        ../$openldap/libraries/libldap/.libs/libldap.so \
+        ../$cups/cups/libcups.so
+    do
+        install -s --strip-program=$STRIP $i $destdir/lib/$exec_prefix/$(basename $i)
+    done
+    install -m 644 $sourcedir/LICENSE.txt $destdir/assets/LICENSE.txt
+    make $makeflags dlls/wineandroid.drv/wine-debug.apk
+    mv $destdir/wine-debug.apk ../../wine-${release:-debug}-$arch.apk
+}
+
+test -z "$release" || rm -rf $basedir
+test -d $basedir || mkdir -p $basedir
+cd $basedir
+
+test -d $android_ndk || config_ndk
+test -d $gradle || config_gradle
+test -d $android_sdk/platforms/android-$sdk_api || config_android_sdk
+test -d $llvm_mingw || config_llvm_mingw
+
+test -d wine || git clone $winetree
+test -z "$release" || (cd wine && git checkout wine-$release)
+if (cd wine && git apply --check "$sourcedir/posix_spawn.patch")
+then
+    (cd wine && git apply "$sourcedir/posix_spawn.patch")
+fi
+test -d $winetools || config_wine_tools
+
+arch=arm64
+host=aarch64-linux-android
+clang_prefix=aarch64-linux-android
+exec_prefix=arm64-v8a
+target_cflags=""
+
+test -d $arch || mkdir $arch
+
+(cd $arch
+PATH=$default_path:$basedir/$llvm_mingw/bin:$basedir/$gradle/bin:$basedir/$android_sdk/cmdline-tools/bin:$basedir/$android_ndk/toolchains/llvm/prebuilt/linux-x86_64/bin
+ANDROID_HOME=$basedir/$android_sdk
+export ANDROID_HOME PATH
+ndkbin=$basedir/$android_ndk/toolchains/llvm/prebuilt/linux-x86_64/bin
+CC=$ndkbin/${clang_prefix}${android_api}-clang
+CXX=$ndkbin/${clang_prefix}${android_api}-clang++
+LD=$ndkbin/ld.lld
+cc=$CC
+AR=$ndkbin/llvm-ar
+RANLIB=$ndkbin/llvm-ranlib
+STRIP=$ndkbin/llvm-strip
+run_configure="./configure --host=$host PKG_CONFIG=false CC=$CC CXX=$CXX LD=$LD AR=$AR RANLIB=$RANLIB STRIP=$STRIP"
+install_all)
