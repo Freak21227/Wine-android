@@ -21,6 +21,12 @@
 
 set -e
 
+# GitHub Actions runner'ı kendi Android SDK'sını set eder; bizimkiyle çakışır.
+unset ANDROID_SDK_ROOT
+unset ANDROID_NDK_ROOT
+unset ANDROID_NDK_HOME
+unset ANDROID_NDK_LATEST_HOME
+
 basedir=$HOME/wine/packages/android
 winetree=https://gitlab.winehq.org/wine/wine.git
 android_root=$HOME/android
@@ -181,6 +187,8 @@ config_wine ()
                 GRADLE=$basedir/$gradle/bin/gradle \
                 ANDROID_HOME=$basedir/$android_sdk \
                 ac_cv_func_getrandom=no)
+    # Gradle'ın SDK konumunu kesin olarak belirle; make sırasında da geçerli olur
+    echo "sdk.dir=$basedir/$android_sdk" > wine/dlls/wineandroid.drv/local.properties
 }
 
 build_all ()
