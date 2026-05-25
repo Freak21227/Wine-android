@@ -1,0 +1,398 @@
+name: Build Wine Android APKs
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Wine release tag (e.g. 9.0). Leave empty for debug build.'
+        required: false
+        default: ''
+
+env:
+  ANDROID_API: 26
+  ANDROID_NDK: android-ndk-r28c
+  GRADLE_VERSION: gradle-9.4.0
+  ANDROID_SDK: android-sdk
+  CMDLINE_TOOLS: commandlinetools-linux-7583922_latest.zip
+  BUILD_TOOLS: 36.0.0
+  SDK_API: 36
+  LLVM_MINGW: llvm-mingw-20250514-ucrt-ubuntu-22.04-x86_64
+  FREETYPE: freetype-2.13.3
+  GMP: gmp-6.3.0
+  NETTLE: nettle-3.10.2
+  GNUTLS: gnutls-3.8.9
+  OPENLDAP: openldap-2.6.10
+  CUPS: cups-2.4.12
+  GECKO: wine-gecko-2.47.4
+  WINETREE: https://gitlab.winehq.org/wine/wine.git
+  BASEDIR: ${{ github.workspace }}/packages/android
+  DOWNLOADS: ${{ github.workspace }}/.cache/wine-packaging
+  # Patch ve diff dosyaları repo'nun root dizininde olmalı, yani:
+  #   <repo-root>/posix_spawn.patch
+  #   <repo-root>/cups.diff
+  #   <repo-root>/LICENSE.txt
+  # ${{ github.workspace }} her zaman repo root'unu gösterir.
+  PATCH_DIR: ${{ github.workspace }}
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. deb-src kaynaklarını ekle ──────────────────────────────────────
+      - name: Add deb-src to sources.list
+        run: |
+          sudo tee -a /etc/apt/sources.list > /dev/null <<EOF
+          deb-src http://archive.ubuntu.com/ubuntu/ jammy main restricted universe multiverse
+          deb-src http://archive.ubuntu.com/ubuntu/ jammy-updates main restricted universe multiverse
+          deb-src http://archive.ubuntu.com/ubuntu/ jammy-backports main restricted universe multiverse
+          deb-src http://security.ubuntu.com/ubuntu jammy-security main restricted universe multiverse
+          EOF
+
+      # ── 3. Sistem bağımlılıkları ──────────────────────────────────────────
+      - name: Install build dependencies
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y --fix-broken
+          sudo apt-get autoremove -y
+          sudo apt-get clean
+          sudo apt-get upgrade -y
+          sudo apt-get install -y \
+            build-essential gcc g++ \
+            gcc-multilib g++-multilib libc6-dev-i386 \
+            flex bison \
+            libgnutls28-dev \
+            libxml2-dev libxslt1-dev \
+            gettext \
+            libfreetype6-dev:i386 \
+            python3 \
+            wget unzip \
+            ca-certificates \
+            git \
+            autoconf automake libtool \
+            pkg-config \
+            openjdk-17-jdk
+          sudo apt-get build-dep wine -y || true
+
+      # ── 4. Cache: İndirilen araçlar / kaynak arşivleri ────────────────────
+      - name: Cache downloaded archives
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.DOWNLOADS }}
+          key: wine-android-downloads-${{ env.ANDROID_NDK }}-${{ env.LLVM_MINGW }}-${{ env.FREETYPE }}-${{ env.GNUTLS }}
+
+      # ── 5. Dizinleri hazırla ──────────────────────────────────────────────
+      - name: Prepare directories
+        run: |
+          mkdir -p ${{ env.BASEDIR }}
+          mkdir -p ${{ env.DOWNLOADS }}
+
+      # ── 6. Android NDK ────────────────────────────────────────────────────
+      - name: Download & extract Android NDK
+        working-directory: ${{ env.BASEDIR }}
+        run: |
+          NDK_ZIP=${{ env.DOWNLOADS }}/${{ env.ANDROID_NDK }}-linux.zip
+          if [ ! -f "$NDK_ZIP" ]; then
+            wget -O "$NDK_ZIP" \
+              https://dl.google.com/android/repository/${{ env.ANDROID_NDK }}-linux.zip
+          fi
+          if [ ! -d "${{ env.ANDROID_NDK }}" ]; then
+            unzip -q "$NDK_ZIP"
+          fi
+
+      # ── 7. Gradle ─────────────────────────────────────────────────────────
+      - name: Download & extract Gradle
+        working-directory: ${{ env.BASEDIR }}
+        run: |
+          GRADLE_ZIP=${{ env.DOWNLOADS }}/${{ env.GRADLE_VERSION }}-bin.zip
+          if [ ! -f "$GRADLE_ZIP" ]; then
+            wget -O "$GRADLE_ZIP" \
+              https://services.gradle.org/distributions/${{ env.GRADLE_VERSION }}-bin.zip
+          fi
+          if [ ! -d "${{ env.GRADLE_VERSION }}" ]; then
+            unzip -q "$GRADLE_ZIP"
+          fi
+
+      # ── 8. Android SDK ────────────────────────────────────────────────────
+      - name: Download & configure Android SDK
+        working-directory: ${{ env.BASEDIR }}
+        run: |
+          CMDLINE_ZIP=${{ env.DOWNLOADS }}/${{ env.CMDLINE_TOOLS }}
+          if [ ! -f "$CMDLINE_ZIP" ]; then
+            wget -O "$CMDLINE_ZIP" \
+              https://dl.google.com/android/repository/${{ env.CMDLINE_TOOLS }}
+          fi
+          mkdir -p ${{ env.ANDROID_SDK }}
+          unzip -n "$CMDLINE_ZIP" -d ${{ env.ANDROID_SDK }}
+          yes | ${{ env.BASEDIR }}/${{ env.ANDROID_SDK }}/cmdline-tools/bin/sdkmanager \
+            --sdk_root=${{ env.BASEDIR }}/${{ env.ANDROID_SDK }} \
+            --licenses >/dev/null || true
+          ${{ env.BASEDIR }}/${{ env.ANDROID_SDK }}/cmdline-tools/bin/sdkmanager \
+            --sdk_root=${{ env.BASEDIR }}/${{ env.ANDROID_SDK }} \
+            --install "platforms;android-${{ env.SDK_API }}" \
+                      "build-tools;${{ env.BUILD_TOOLS }}"
+
+      # ── 9. llvm-mingw ─────────────────────────────────────────────────────
+      - name: Download & extract llvm-mingw
+        working-directory: ${{ env.BASEDIR }}
+        run: |
+          LLVM_TAR=${{ env.DOWNLOADS }}/${{ env.LLVM_MINGW }}.tar.xz
+          if [ ! -f "$LLVM_TAR" ]; then
+            wget -O "$LLVM_TAR" \
+              https://github.com/mstorsjo/llvm-mingw/releases/download/20250514/${{ env.LLVM_MINGW }}.tar.xz
+          fi
+          if [ ! -d "${{ env.LLVM_MINGW }}" ]; then
+            tar xf "$LLVM_TAR"
+          fi
+
+      # ── 10. Wine kaynak kodunu klonla ─────────────────────────────────────
+      - name: Clone Wine source
+        working-directory: ${{ env.BASEDIR }}
+        run: |
+          if [ ! -d "wine" ]; then
+            git clone ${{ env.WINETREE }} wine
+          fi
+          RELEASE="${{ github.event.inputs.release }}"
+          if [ -n "$RELEASE" ]; then
+            (cd wine && git checkout wine-$RELEASE)
+          fi
+          # posix_spawn.patch repo root'unda (${{ env.PATCH_DIR }}) olmalı
+          if [ -f "${{ env.PATCH_DIR }}/posix_spawn.patch" ]; then
+            if (cd wine && git apply --check "${{ env.PATCH_DIR }}/posix_spawn.patch" 2>/dev/null); then
+              (cd wine && git apply "${{ env.PATCH_DIR }}/posix_spawn.patch")
+            fi
+          fi
+
+      # ── 11. Wine host araçlarını derle (tools/) ───────────────────────────
+      - name: Build Wine host tools
+        working-directory: ${{ env.BASEDIR }}
+        run: |
+          if [ ! -d "tools" ]; then
+            mkdir tools
+            (cd tools && ../wine/configure --without-x --enable-win64 --silent \
+              && make --no-print-directory --silent -j$(nproc) __tooldeps__ nls/all)
+          fi
+
+      # ── 12. Bağımlılıkları derle ve APK'yı oluştur (arm64) ───────────────
+      - name: Build dependencies and APK (arm64)
+        working-directory: ${{ env.BASEDIR }}
+        env:
+          RELEASE: ${{ github.event.inputs.release }}
+        run: |
+          set -e
+
+          MAKEFLAGS="--no-print-directory --silent -j$(nproc)"
+          DEFAULT_PATH=/usr/lib/ccache:$HOME/bin:/usr/sbin:/sbin:/usr/bin:/bin:\
+          ${{ env.BASEDIR }}/${{ env.ANDROID_NDK }}/toolchains/llvm/prebuilt/linux-x86_64/bin:\
+          ${{ env.BASEDIR }}/${{ env.GRADLE_VERSION }}/bin:\
+          ${{ env.BASEDIR }}/${{ env.ANDROID_SDK }}/cmdline-tools/bin
+
+          # ── arm64 sabitleri ──────────────────────────────────────────────
+          ARCH=arm64
+          HOST=aarch64-linux-android
+          CLANG_PREFIX=aarch64-linux-android
+          EXEC_PREFIX=arm64-v8a
+          TARGET_CFLAGS=""
+
+          NDKBIN=${{ env.BASEDIR }}/${{ env.ANDROID_NDK }}/toolchains/llvm/prebuilt/linux-x86_64/bin
+          CC=$NDKBIN/${CLANG_PREFIX}${{ env.ANDROID_API }}-clang
+          CXX=$NDKBIN/${CLANG_PREFIX}${{ env.ANDROID_API }}-clang++
+          LD=$NDKBIN/ld.lld
+          AR=$NDKBIN/llvm-ar
+          RANLIB=$NDKBIN/llvm-ranlib
+          STRIP=$NDKBIN/llvm-strip
+          RUN_CONFIGURE="./configure --silent --host=$HOST PKG_CONFIG=false \
+            CC=$CC CXX=$CXX LD=$LD AR=$AR RANLIB=$RANLIB STRIP=$STRIP"
+
+          export PATH=$DEFAULT_PATH:${{ env.BASEDIR }}/${{ env.LLVM_MINGW }}/bin
+          export ANDROID_HOME=${{ env.BASEDIR }}/${{ env.ANDROID_SDK }}
+
+          mkdir -p ${{ env.BASEDIR }}/$ARCH
+          cd ${{ env.BASEDIR }}/$ARCH
+
+          # -- freetype --
+          if [ ! -d "${{ env.FREETYPE }}" ]; then
+            ARCHIVE=${{ env.DOWNLOADS }}/${{ env.FREETYPE }}.tar.xz
+            [ -f "$ARCHIVE" ] || wget -O "$ARCHIVE" \
+              http://download.savannah.gnu.org/releases/freetype/${{ env.FREETYPE }}.tar.xz
+            tar xf "$ARCHIVE"
+            (cd ${{ env.FREETYPE }} && $RUN_CONFIGURE --without-png && make $MAKEFLAGS)
+          fi
+
+          # -- gmp --
+          if [ ! -d "${{ env.GMP }}" ]; then
+            ARCHIVE=${{ env.DOWNLOADS }}/${{ env.GMP }}.tar.xz
+            [ -f "$ARCHIVE" ] || wget -O "$ARCHIVE" \
+              https://ftp.gnu.org/gnu/gmp/${{ env.GMP }}.tar.xz
+            tar xf "$ARCHIVE"
+            (cd ${{ env.GMP }} && $RUN_CONFIGURE --disable-static && make $MAKEFLAGS)
+          fi
+
+          # -- nettle --
+          if [ ! -d "${{ env.NETTLE }}" ]; then
+            ARCHIVE=${{ env.DOWNLOADS }}/${{ env.NETTLE }}.tar.gz
+            [ -f "$ARCHIVE" ] || wget -O "$ARCHIVE" \
+              https://ftp.gnu.org/gnu/nettle/${{ env.NETTLE }}.tar.gz
+            tar xf "$ARCHIVE"
+            GMPDIR=$(pwd)/${{ env.GMP }}
+            (cd ${{ env.NETTLE }} && $RUN_CONFIGURE \
+              --disable-shared --disable-documentation \
+              --with-lib-path=$GMPDIR/.libs CPPFLAGS=-I$GMPDIR \
+              && make $MAKEFLAGS)
+          fi
+
+          # -- gnutls --
+          if [ ! -d "${{ env.GNUTLS }}" ]; then
+            VERSION=v$(echo "${{ env.GNUTLS }}" | grep -oP '\d+\.\d+')
+            ARCHIVE=${{ env.DOWNLOADS }}/${{ env.GNUTLS }}.tar.xz
+            [ -f "$ARCHIVE" ] || wget -O "$ARCHIVE" \
+              https://www.gnupg.org/ftp/gcrypt/gnutls/$VERSION/${{ env.GNUTLS }}.tar.xz
+            tar xf "$ARCHIVE"
+            GMPDIR=$(pwd)/${{ env.GMP }}
+            NETTLEDIR=$(pwd)/${{ env.NETTLE }}
+            [ -e ${{ env.NETTLE }}/nettle ] || ln -s . ${{ env.NETTLE }}/nettle
+            (cd ${{ env.GNUTLS }} && ./configure --host=$HOST \
+              --without-p11-kit --without-idn --without-brotli --without-zstd \
+              --without-tpm --without-tpm2 \
+              --with-included-libtasn1 --with-included-unistring \
+              --disable-cxx --disable-maintainer-mode --disable-static \
+              --disable-doc --disable-tools --disable-tests \
+              CC=$CC PKG_CONFIG=true \
+              GMP_CFLAGS="-I$GMPDIR -L$GMPDIR/.libs -lgmp" \
+              GMP_LIBS=$GMPDIR/.libs/libgmp.so \
+              NETTLE_CFLAGS=-I$NETTLEDIR \
+              NETTLE_LIBS="-L$NETTLEDIR -lnettle" \
+              HOGWEED_CFLAGS=-I$NETTLEDIR \
+              HOGWEED_LIBS="-L$NETTLEDIR -lhogweed -lnettle $GMPDIR/.libs/libgmp.so" \
+              && make $MAKEFLAGS)
+          fi
+
+          # -- openldap --
+          if [ ! -d "${{ env.OPENLDAP }}" ]; then
+            ARCHIVE=${{ env.DOWNLOADS }}/${{ env.OPENLDAP }}.tgz
+            [ -f "$ARCHIVE" ] || wget -O "$ARCHIVE" \
+              https://www.openldap.org/software/download/OpenLDAP/openldap-release/${{ env.OPENLDAP }}.tgz
+            tar xf "$ARCHIVE"
+            cp ${{ env.GNUTLS }}/build-aux/ltmain.sh \
+               ${{ env.GNUTLS }}/build-aux/config.guess \
+               ${{ env.GNUTLS }}/build-aux/config.sub \
+               ${{ env.OPENLDAP }}/build
+            grep -q '#include <wchar.h>' \
+              ${{ env.OPENLDAP }}/libraries/libldap/utf-8-conv.c || \
+              sed -i '1i#include <wchar.h>' \
+                ${{ env.OPENLDAP }}/libraries/libldap/utf-8-conv.c
+            (cd ${{ env.OPENLDAP }} && autoreconf -fi && $RUN_CONFIGURE \
+              --with-yielding_select=yes --disable-bdb --disable-hdb \
+              ac_cv_func_memcmp_working=yes \
+              CPPFLAGS="-DANDROID -DHAVE_WCHAR_H=1" \
+              LDFLAGS="-Wl,--undefined-version" CC=$CC \
+              && make $MAKEFLAGS)
+          fi
+
+          # -- cups --
+          # cups.diff repo root'unda (${{ env.PATCH_DIR }}) olmalı
+          if [ ! -d "${{ env.CUPS }}" ]; then
+            CUPS_VERSION=v$(echo "${{ env.CUPS }}" | grep -oP '[\d.]+$')
+            ARCHIVE=${{ env.DOWNLOADS }}/${{ env.CUPS }}-source.tar.gz
+            [ -f "$ARCHIVE" ] || wget -O "$ARCHIVE" \
+              https://github.com/OpenPrinting/cups/releases/download/$CUPS_VERSION/${{ env.CUPS }}-source.tar.gz
+            tar xf "$ARCHIVE"
+            [ -f "${{ env.PATCH_DIR }}/cups.diff" ] && \
+              patch -d ${{ env.CUPS }} -p1 -s < ${{ env.PATCH_DIR }}/cups.diff
+            GNUTLSDIR=$(pwd)/${{ env.GNUTLS }}
+            NETTLEDIR=$(pwd)/${{ env.NETTLE }}
+            GMPDIR=$(pwd)/${{ env.GMP }}
+            (cd ${{ env.CUPS }} && $RUN_CONFIGURE \
+              --disable-gssapi --with-tls=gnutls PKGCONFIG=/bin/false \
+              GNUTLS_CFLAGS="-I$GNUTLSDIR/lib/includes" \
+              GNUTLS_LIBS="-L$GNUTLSDIR/lib/.libs -lgnutls \
+                -L$NETTLEDIR -lhogweed -lnettle \
+                -L$GMPDIR/.libs -lgmp -lz" \
+              && cd cups && make $MAKEFLAGS libs)
+          fi
+
+          # -- wine configure --
+          if [ ! -d "wine" ]; then
+            mkdir wine
+            (cd wine && ${{ env.BASEDIR }}/wine/configure --silent \
+              --host=$HOST \
+              --with-wine-tools=${{ env.BASEDIR }}/tools \
+              CC=$CC \
+              CFLAGS="$TARGET_CFLAGS -fPIC" \
+              FREETYPE_CFLAGS="-I../${{ env.FREETYPE }}/include" \
+              FREETYPE_LIBS="-L../${{ env.FREETYPE }}/objs/.libs -lfreetype" \
+              GNUTLS_CFLAGS="-I../${{ env.GNUTLS }}/lib/includes" \
+              GNUTLS_LIBS="-L../${{ env.GNUTLS }}/lib/.libs -lgnutls \
+                -L../${{ env.NETTLE }} -lhogweed -lnettle \
+                -L../${{ env.GMP }}/.libs -lgmp -lz" \
+              LDAP_CFLAGS="-I../${{ env.OPENLDAP }}/include" \
+              LDAP_LIBS="-L../${{ env.OPENLDAP }}/libraries/liblber/.libs \
+                -L../${{ env.OPENLDAP }}/libraries/libldap/.libs \
+                -lldap -llber" \
+              CUPS_CFLAGS="-I../${{ env.CUPS }}" \
+              CUPS_LIBS="-L../${{ env.CUPS }}/cups -lcups \
+                -L../${{ env.GNUTLS }}/lib/.libs -lgnutls \
+                -L../${{ env.NETTLE }} -lhogweed -lnettle \
+                -L../${{ env.GMP }}/.libs -lgmp -lz" \
+              GRADLE=${{ env.BASEDIR }}/${{ env.GRADLE_VERSION }}/bin/gradle \
+              ANDROID_HOME=${{ env.BASEDIR }}/${{ env.ANDROID_SDK }} \
+              ac_cv_func_getrandom=no)
+          fi
+
+          # -- build & install / APK oluştur --
+          DESTDIR=$(pwd)/wine/dlls/wineandroid.drv
+          (cd wine && make $MAKEFLAGS all)
+          rm -rf $DESTDIR/assets $DESTDIR/lib $DESTDIR/build $DESTDIR/wine-debug.apk
+          mkdir -p $DESTDIR/assets $DESTDIR/lib/$EXEC_PREFIX
+          (cd wine && make install-lib prefix= DESTDIR=dlls/wineandroid.drv/assets STRIP=true)
+
+          for lib in \
+            ${{ env.FREETYPE }}/objs/.libs/libfreetype.so \
+            ${{ env.GMP }}/.libs/libgmp.so \
+            ${{ env.GNUTLS }}/lib/.libs/libgnutls.so \
+            ${{ env.OPENLDAP }}/libraries/liblber/.libs/liblber.so \
+            ${{ env.OPENLDAP }}/libraries/libldap/.libs/libldap.so \
+            ${{ env.CUPS }}/cups/libcups.so
+          do
+            install -s --strip-program=$STRIP $lib \
+              $DESTDIR/lib/$EXEC_PREFIX/$(basename $lib)
+          done
+
+          # LICENSE.txt repo root'unda (${{ env.PATCH_DIR }}) olmalı
+          [ -f "${{ env.PATCH_DIR }}/LICENSE.txt" ] && \
+            install -m 644 ${{ env.PATCH_DIR }}/LICENSE.txt $DESTDIR/assets/LICENSE.txt
+
+          (cd wine && make $MAKEFLAGS dlls/wineandroid.drv/wine-debug.apk)
+
+          APK_NAME="wine-${RELEASE:-debug}-arm64.apk"
+          mv $DESTDIR/wine-debug.apk ${{ env.BASEDIR }}/$APK_NAME
+          echo "Built: $APK_NAME"
+
+      # ── 13. APK'yı artifact olarak yükle ─────────────────────────────────
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wine-android-arm64-apk
+          path: ${{ env.BASEDIR }}/wine-*-arm64.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      # ── 14. Release yüklemesi (opsiyonel) ─────────────────────────────────
+      - name: Upload to GitHub Release
+        if: ${{ github.event.inputs.release != '' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: wine-${{ github.event.inputs.release }}
+          files: ${{ env.BASEDIR }}/wine-*-arm64.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

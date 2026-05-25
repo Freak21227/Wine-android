@@ -1,0 +1,54 @@
+--- cups-orig/config-scripts/cups-sharedlibs.m4	2025-04-08 13:47:14.000000000 +0300
++++ /home/mcpbot/wine/packages/android/x86/cups-2.4.12/config-scripts/cups-sharedlibs.m4	2026-05-25 18:49:28.154428813 +0300
+@@ -28,6 +28,14 @@
+ 	DSO="\$(CC)"
+ 	DSOXX="\$(CXX)"
+ 	DSOFLAGS="$DSOFLAGS -Wl,-h\`basename \$@\` -G"
++    ], [linux-android*], [
++	LIBCUPS="lib$cupsbase.so"
++	AS_IF([test "x$cupsimagebase" != x], [
++	    LIBCUPSIMAGE="lib$cupsimagebase.so"
++	])
++	DSO="\$(CC)"
++	DSOXX="\$(CXX)"
++	DSOFLAGS="$DSOFLAGS -shared \$(OPTIM)"
+     ], [linux* | gnu* | *bsd* | solaris*], [
+ 	LIBCUPS="lib$cupsbase.so.2"
+ 	AS_IF([test "x$cupsimagebase" != x], [
+--- cups-orig/configure	2025-04-08 13:47:14.000000000 +0300
++++ /home/mcpbot/wine/packages/android/x86/cups-2.4.12/configure	2026-05-25 18:49:28.154876943 +0300
+@@ -9978,6 +9978,22 @@
+ fi
+ 
+ fi
++    if test $have_tls = 0 -a -n "$GNUTLS_CFLAGS" -a -n "$GNUTLS_LIBS"
++then :
++
++	have_tls="1"
++	with_tls="gnutls"
++	TLSLIBS="$GNUTLS_LIBS"
++	TLSFLAGS="$GNUTLS_CFLAGS"
++	PKGCONFIG_LIBS_STATIC="$PKGCONFIG_LIBS_STATIC $TLSLIBS"
++
++printf "%s\n" "#define HAVE_TLS 1" >>confdefs.h
++
++
++printf "%s\n" "#define HAVE_GNUTLS 1" >>confdefs.h
++
++
++fi
+     if test $have_tls = 0 -a "x$LIBGNUTLSCONFIG" != x
+ then :
+ 
+--- cups-orig/cups/thread.c	2025-04-08 13:47:14.000000000 +0300
++++ /home/mcpbot/wine/packages/android/x86/cups-2.4.12/cups/thread.c	2026-05-25 18:50:21.205638088 +0300
+@@ -154,7 +154,9 @@
+ void
+ _cupsThreadCancel(_cups_thread_t thread)/* I - Thread ID */
+ {
++#ifndef __ANDROID__
+   pthread_cancel(thread);
++#endif
+ }
+ 
+ 
