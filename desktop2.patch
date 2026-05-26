@@ -1,44 +1,44 @@
-From 8c06a75bcf84134be8e39b17ee2e7462cafd6dcf Mon Sep 17 00:00:00 2001
+From bc1ed69a75507a0ca7e92c2fd37827de25eaa62b Mon Sep 17 00:00:00 2001
 From: Twaik Yont <9674930+twaik@users.noreply.github.com>
-Date: Tue, 21 Apr 2026 19:50:45 +0300
-Subject: [PATCH] wineandroid: request dynamic desktop size using -1x-1
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
+Date: Tue, 21 Apr 2026 19:44:47 +0300
+Subject: [PATCH] wineandroid: force window invalidation on WM_ANDROID_REFRESH
 
-Use “-1x-1” instead of an empty size in the /desktop option when
-launching explorer.exe.
+Replace NtUserExposeWindowSurface() with NtUserRedrawWindow() when
+handling WM_ANDROID_REFRESH for non-OpenGL windows.
 
-An empty size causes get_default_desktop_size() to be used, which falls
-back to a fixed default (typically 800x600). This prevents the desktop
-from matching the actual display size provided by the Android backend.
+NtUserExposeWindowSurface() only exposes the existing surface contents,
+but does not invalidate the window or trigger WM_PAINT / WM_ERASEBKGND.
+As a result, when the display resolution changes, windows (including the
+desktop window managed by explorer.exe) may be resized without receiving
+a repaint, leaving stale contents on screen.
 
-Passing “-1x-1” is accepted by parse_size() and results in large unsigned
-values, which are then clamped by the driver to the current screen size.
-This effectively requests a dynamically sized desktop matching the
-Android display.
+Using NtUserRedrawWindow() ensures that the window is properly
+invalidated and repainted, so background and client areas are refreshed
+correctly after resolution changes.
 
-This ensures that the desktop resolution is derived from the backend
-instead of being forced to the default fixed size.
+This fixes cases where the desktop background is not redrawn after
+applying a new display mode.
 
 Signed-off-by: Twaik Yont <9674930+twaik@users.noreply.github.com>
 ---
- dlls/wineandroid.drv/WineActivity.java | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
+ dlls/wineandroid.drv/window.c | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
 
-diff --git a/dlls/wineandroid.drv/WineActivity.java b/dlls/wineandroid.drv/WineActivity.java
-index 6488188b93a..f0bade27a28 100644
---- a/dlls/wineandroid.drv/WineActivity.java
-+++ b/dlls/wineandroid.drv/WineActivity.java
-@@ -169,7 +169,7 @@ private final void runWine( String loader, String cmdline )
-     {
-         String[] cmd = { loader,
-                          "c:\\windows\\system32\\explorer.exe",
--                         "/desktop=shell,,android",
-+                         "/desktop=shell,-1x-1,android",
-                          cmdline };
- 
-         String err = wine_init( cmd );
+diff --git a/dlls/wineandroid.drv/window.c b/dlls/wineandroid.drv/window.c
+index 97eb3004ba8..5ce4828e1a4 100644
+--- a/dlls/wineandroid.drv/window.c
++++ b/dlls/wineandroid.drv/window.c
+@@ -1197,9 +1197,7 @@ LRESULT ANDROID_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
+             detach_client_surfaces( hwnd );
+         }
+         else
+-        {
+-            NtUserExposeWindowSurface( hwnd, 0, NULL, 0 );
+-        }
++            NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME );
+         return 0;
+     default:
+         FIXME( "got window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (long)wp, lp );
 -- 
 GitLab
 
