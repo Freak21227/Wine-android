@@ -184,6 +184,7 @@ config_wine ()
                 --disable-tests \
                 --enable-archs=arm64ec,aarch64,i386 \
                 CC=$CC \
+                --with-mingw=clang \
                 CFLAGS="$target_cflags -fPIC" \
                 FREETYPE_CFLAGS="-I../$freetype/include" \
                 FREETYPE_LIBS="-L../$freetype/objs/.libs -lfreetype" \
