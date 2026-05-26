@@ -44,7 +44,7 @@ android_sdk=android-sdk
 cmdline_tools=commandlinetools-linux-7583922_latest.zip
 build_tools=36.0.0
 sdk_api=36
-llvm_mingw=llvm-mingw-20250514-ucrt-ubuntu-22.04-x86_64
+llvm_mingw=llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64
 freetype=freetype-2.13.3
 gmp=gmp-6.3.0
 nettle=nettle-3.10.2
@@ -96,7 +96,7 @@ config_android_sdk ()
 
 config_llvm_mingw ()
 {
-    download $llvm_mingw https://github.com/mstorsjo/llvm-mingw/releases/download/20250514/$llvm_mingw.tar.xz
+    download $llvm_mingw https://github.com/bylaws/llvm-mingw/releases/download/20250920/$llvm_mingw.tar.xz
 }
 
 config_freetype ()
@@ -165,6 +165,7 @@ config_wine_tools ()
         --without-x \
         --enable-win64 \
         --disable-tests \
+        --enable-archs=arm64ec,aarch64,i386 \
         && make $makeflags __tooldeps__ nls/all)
 }
 
@@ -183,8 +184,9 @@ config_wine ()
                 --with-wine-tools=../../tools \
                 --disable-tests \
                 --enable-archs=arm64ec,aarch64,i386 \
+                --with-mingw \
                 CC=$CC \
-                --with-mingw=clang \
+                DLLTOOL=$basedir/$llvm_mingw/bin/llvm-dlltool \
                 CFLAGS="$target_cflags -fPIC" \
                 FREETYPE_CFLAGS="-I../$freetype/include" \
                 FREETYPE_LIBS="-L../$freetype/objs/.libs -lfreetype" \
