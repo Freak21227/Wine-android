@@ -28,7 +28,8 @@ unset ANDROID_NDK_HOME
 unset ANDROID_NDK_LATEST_HOME
 
 basedir=$HOME/wine/packages/android
-winetree=https://gitlab.winehq.org/wine/wine.git
+winetree=https://gitlab.winehq.org/twaik/wine.git
+wineandroid_branch=wineandroid-move-ioctl-to-java-thread
 android_root=$HOME/android
 android_api=26
 default_path=/usr/lib/ccache:$HOME/bin:/usr/sbin:/sbin:/usr/bin:/bin:$android_root/tools:$android_root/platform-tools
@@ -181,6 +182,7 @@ config_wine ()
     (cd wine && ../../wine/configure --host=$host \
                 --with-wine-tools=../../tools \
                 --disable-tests \
+                --enable-archs=arm64ec,aarch64,i386 \
                 CC=$CC \
                 CFLAGS="$target_cflags -fPIC" \
                 FREETYPE_CFLAGS="-I../$freetype/include" \
@@ -238,7 +240,7 @@ test -d $android_sdk/platforms/android-$sdk_api || config_android_sdk
 test -d $llvm_mingw || config_llvm_mingw
 
 # Wine'ı --depth 1 ile klonla (tek commit, hızlı indirme)
-test -d wine || git clone --depth 1 $winetree
+test -d wine || git clone --depth 1 --branch $wineandroid_branch $winetree
 test -z "$release" || (cd wine && git fetch --depth 1 origin tag wine-$release && git checkout wine-$release)
 
 # sourcedir içindeki tüm .patch dosyalarını isim sırasına göre uygula
