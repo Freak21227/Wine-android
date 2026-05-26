@@ -160,7 +160,11 @@ config_cups ()
 config_wine_tools ()
 {
     mkdir tools
-    (cd tools && ../wine/configure --without-x --enable-win64 && make $makeflags __tooldeps__ nls/all)
+    (cd tools && ../wine/configure \
+        --without-x \
+        --enable-win64 \
+        --disable-tests \
+        && make $makeflags __tooldeps__ nls/all)
 }
 
 config_wine ()
@@ -174,7 +178,10 @@ config_wine ()
     test -d $cups || config_cups
     rm -rf wine
     mkdir wine
-    (cd wine && ../../wine/configure --host=$host --with-wine-tools=../../tools CC=$CC \
+    (cd wine && ../../wine/configure --host=$host \
+                --with-wine-tools=../../tools \
+                --disable-tests \
+                CC=$CC \
                 CFLAGS="$target_cflags -fPIC" \
                 FREETYPE_CFLAGS="-I../$freetype/include" \
                 FREETYPE_LIBS="-L../$freetype/objs/.libs -lfreetype" \
@@ -230,16 +237,33 @@ test -d $gradle || config_gradle
 test -d $android_sdk/platforms/android-$sdk_api || config_android_sdk
 test -d $llvm_mingw || config_llvm_mingw
 
-test -d wine || git clone $winetree
-test -z "$release" || (cd wine && git checkout wine-$release)
-if (cd wine && git apply --check "$sourcedir/posix_spawn.patch")
-then
-    (cd wine && git apply "$sourcedir/posix_spawn.patch")
-fi
-if (cd wine && git apply --check "$sourcedir/sqlite3.patch")
-then
-    (cd wine && git apply "$sourcedir/sqlite3.patch")
-fi
+# Wine'ı --depth 1 ile klonla (tek commit, hızlı indirme)
+test -d wine || git clone --depth 1 $winetree
+test -z "$release" || (cd wine && git fetch --depth 1 origin tag wine-$release && git checkout wine-$release)
+
+# sourcedir içindeki tüm .patch dosyalarını isim sırasına göre uygula
+# Örnek dosya adları: java1.patch, java2.patch, desktop1.patch, desktop2.patch, ...
+# "git apply --check" ile önce kontrol edilir; zaten uygulanmış veya çakışan patch'ler atlanır.
+apply_patches ()
+{
+    patchlist=$(find "$sourcedir" -maxdepth 1 -name '*.patch' | sort)
+    if [ -z "$patchlist" ]; then
+        echo "No .patch files found in $sourcedir"
+        return
+    fi
+    for patchfile in $patchlist; do
+        patchname=$(basename "$patchfile")
+        if (cd wine && git apply --check "$patchfile" 2>/dev/null); then
+            echo "Applying $patchname ..."
+            (cd wine && git apply "$patchfile")
+        else
+            echo "Skipping $patchname (already applied or does not apply cleanly)"
+        fi
+    done
+}
+
+apply_patches
+
 test -d $winetools || config_wine_tools
 
 arch=arm64
