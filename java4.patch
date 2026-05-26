@@ -1,0 +1,434 @@
+From a62afde20c2542210e2099f4a0c54029633d3c94 Mon Sep 17 00:00:00 2001
+From: Twaik Yont <9674930+twaik@users.noreply.github.com>
+Date: Wed, 15 Apr 2026 11:01:53 +0300
+Subject: [PATCH] wineandroid: split Android driver and Wine into separate
+ processes
+
+Move the Android JNI startup entry point from ntdll to wineandroid.drv
+and use it to initialize the Android-facing driver side in the JVM
+process.
+
+WineActivity now starts the Wine process separately, while the JVM
+process keeps only the Android driver side. This follows the same
+client/server-style separation as winex11 and winewayland, where Wine
+runs as a client of an external display server.
+
+With Wine now running in its own process, it is no longer subject to
+the seccomp restrictions imposed on the JVM process and does not
+interfere with the JVM runtime context (signals, thread state, register
+usage, etc.). The old Android-specific JNI bootstrap code is removed
+from ntdll.
+
+Signed-off-by: Twaik Yont <9674930+twaik@users.noreply.github.com>
+---
+ dlls/ntdll/unix/loader.c               | 106 -------------------------
+ dlls/wineandroid.drv/WineActivity.java |  36 +++++----
+ dlls/wineandroid.drv/android.h         |   5 +-
+ dlls/wineandroid.drv/device.c          |  53 ++-----------
+ dlls/wineandroid.drv/init.c            |   9 ++-
+ dlls/wineandroid.drv/window.c          |   3 +-
+ 6 files changed, 37 insertions(+), 175 deletions(-)
+
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index c1e6b588dcb..c1321ce679d 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -77,9 +77,6 @@
+ #else
+   extern char **environ;
+ #endif
+-#ifdef __ANDROID__
+-# include <jni.h>
+-#endif
+ 
+ #include "ntstatus.h"
+ #include "windef.h"
+@@ -1874,109 +1871,6 @@ static void start_main_thread(void)
+     server_init_process_done();
+ }
+ 
+-#ifdef __ANDROID__
+-
+-#ifndef WINE_JAVA_CLASS
+-#define WINE_JAVA_CLASS "org/winehq/wine/WineActivity"
+-#endif
+-
+-DECLSPEC_EXPORT JavaVM *java_vm = NULL;
+-DECLSPEC_EXPORT jobject java_object = 0;
+-DECLSPEC_EXPORT unsigned short java_gdt_sel = 0;
+-
+-/* main Wine initialisation */
+-static jstring wine_init_jni( JNIEnv *env, jobject obj, jobjectArray cmdline )
+-{
+-    char **argv;
+-    char *str;
+-    char error[1024], *winedebuglog = NULL;
+-    int i, argc, length;
+-    void (*update_func)( const char * );
+-
+-    /* get the command line array */
+-
+-    argc = (*env)->GetArrayLength( env, cmdline );
+-    for (i = length = 0; i < argc; i++)
+-    {
+-        jobject str_obj = (*env)->GetObjectArrayElement( env, cmdline, i );
+-        length += (*env)->GetStringUTFLength( env, str_obj ) + 1;
+-    }
+-
+-    argv = malloc( (argc + 1) * sizeof(*argv) + length );
+-    str = (char *)(argv + argc + 1);
+-    for (i = 0; i < argc; i++)
+-    {
+-        jobject str_obj = (*env)->GetObjectArrayElement( env, cmdline, i );
+-        length = (*env)->GetStringUTFLength( env, str_obj );
+-        (*env)->GetStringUTFRegion( env, str_obj, 0,
+-                                    (*env)->GetStringLength( env, str_obj ), str );
+-        argv[i] = str;
+-        str[length] = 0;
+-        str += length + 1;
+-    }
+-    argv[argc] = NULL;
+-
+-    /* set the environment variables */
+-
+-    // Activity always modifies LD_LIBRARY_PATH in order to load libraries
+-    // from custom location in JVM process.
+-    update_func = dlsym( RTLD_DEFAULT, "android_update_LD_LIBRARY_PATH" );
+-    if (update_func) update_func( getenv("LD_LIBRARY_PATH") );
+-
+-    winedebuglog = getenv("WINEDEBUGLOG");
+-    if (winedebuglog)
+-    {
+-        int fd = open( winedebuglog, O_WRONLY | O_CREAT | O_APPEND, 0666 );
+-        if (fd != -1)
+-        {
+-            dup2( fd, 2 );
+-            close( fd );
+-        }
+-    }
+-
+-    java_object = (*env)->NewGlobalRef( env, obj );
+-
+-    main_argc = argc;
+-    main_argv = argv;
+-
+-    init_paths();
+-    init_environment();
+-
+-#ifdef __i386__
+-    {
+-        unsigned short java_fs;
+-        __asm__( "mov %%fs,%0" : "=r" (java_fs) );
+-        if (!(java_fs & 4)) java_gdt_sel = java_fs;
+-        __asm__( "mov %0,%%fs" :: "r" (0) );
+-        start_main_thread();
+-        __asm__( "mov %0,%%fs" :: "r" (java_fs) );
+-    }
+-#else
+-    start_main_thread();
+-#endif
+-    return (*env)->NewStringUTF( env, error );
+-}
+-
+-jint JNI_OnLoad( JavaVM *vm, void *reserved )
+-{
+-    static const JNINativeMethod method =
+-    {
+-        "wine_init", "([Ljava/lang/String;)Ljava/lang/String;", wine_init_jni
+-    };
+-
+-    JNIEnv *env;
+-    jclass class;
+-
+-    virtual_init();
+-
+-    java_vm = vm;
+-    if ((*vm)->AttachCurrentThread( vm, &env, NULL ) != JNI_OK) return JNI_ERR;
+-    if (!(class = (*env)->FindClass( env, WINE_JAVA_CLASS ))) return JNI_ERR;
+-    (*env)->RegisterNatives( env, class, &method, 1 );
+-    return JNI_VERSION_1_6;
+-}
+-
+-#endif  /* __ANDROID__ */
+ 
+ #ifdef __APPLE__
+ static void *apple_wine_thread( void *arg )
+diff --git a/dlls/wineandroid.drv/WineActivity.java b/dlls/wineandroid.drv/WineActivity.java
+index 23b06386652..bf2408b4410 100644
+--- a/dlls/wineandroid.drv/WineActivity.java
++++ b/dlls/wineandroid.drv/WineActivity.java
+@@ -61,8 +61,7 @@
+ 
+ public class WineActivity extends Activity
+ {
+-    private native String wine_init( String[] cmdline );
+-    private native void wine_looper_init();
++    private native void wine_init();
+     public native void wine_desktop_changed( int width, int height );
+     public native void wine_config_changed( int dpi );
+     public native void wine_surface_changed( int hwnd, Surface surface, boolean opengl );
+@@ -138,6 +137,7 @@ private void loadWine( String cmdline )
+         File dlldir = new File( libdir, "wine" );
+         File prefix = new File( getFilesDir(), "prefix" );
+         File loader = new File( dlldir, get_so_dir(wine_abi) + "/wine" );
++        File log = null;
+         String locale = Locale.getDefault().getLanguage() + "_" +
+             Locale.getDefault().getCountry() + ".UTF-8";
+ 
+@@ -156,7 +156,7 @@ private void loadWine( String cmdline )
+         if (winedebug == null) winedebug = readFileString( new File( getFilesDir(), "winedebug" ));
+         if (winedebug != null)
+         {
+-            File log = new File( getFilesDir(), "log" );
++            log = new File( getFilesDir(), "log" );
+             putenv( "WINEDEBUG", winedebug );
+             putenv( "WINEDEBUGLOG", log.toString() );
+             Log.i( LOGTAG, "logging to " + log.toString() );
+@@ -169,18 +169,32 @@ private void loadWine( String cmdline )
+             System.load( dlldir.toString() + get_so_dir(wine_abi) + "/" + lib );
+         prefix.mkdirs();
+ 
+-        runWine( loader.toString(), cmdline );
++        runWine( loader.toString(), cmdline, log );
+     }
+ 
+-    private final void runWine( String loader, String cmdline )
++    private final void runWine( String loader, String cmdline, File log )
+     {
++        CountDownLatch latch = new CountDownLatch(1);
+         String[] cmd = { loader,
+                          "c:\\windows\\system32\\explorer.exe",
+                          "/desktop=shell,,android",
+                          cmdline };
+ 
+-        String err = wine_init( cmd );
+-        Log.e( LOGTAG, err );
++        runOnUiThread( new Runnable() { public void run() {
++            try { wine_init(); } finally { latch.countDown(); }
++        }});
++        try { latch.await(); } catch ( Exception e ) {}
++
++        try {
++            new ProcessBuilder(cmd)
++                .redirectErrorStream(true)
++                .redirectOutput(ProcessBuilder.Redirect.appendTo(
++                    log != null ? log : new File("/dev/null")
++                ))
++                .start();
++        } catch (IOException e) {
++            Log.e("WineError", "Failed to exec " + String.join(" ", cmd) + ": " + e);
++        }
+     }
+ 
+     private void createProgressDialog( final int max, final String message )
+@@ -893,12 +907,4 @@ public void windowPosChanged( final int hwnd, final int flags, final int insert_
+             public void run() { window_pos_changed( hwnd, flags, insert_after, owner, style,
+                                                     window_rect, client_rect, visible_rect ); }} );
+     }
+-
+-    private void obtainLooper() {
+-        CountDownLatch latch = new CountDownLatch(1);
+-        runOnUiThread( new Runnable() { public void run() {
+-            try { wine_looper_init(); } finally { latch.countDown(); }
+-        }});
+-        try { latch.await(); } catch ( Exception e ) {}
+-    }
+ }
+diff --git a/dlls/wineandroid.drv/android.h b/dlls/wineandroid.drv/android.h
+index 853c8318601..cc558aa01f6 100644
+--- a/dlls/wineandroid.drv/android.h
++++ b/dlls/wineandroid.drv/android.h
+@@ -81,7 +81,6 @@ extern UINT ANDROID_OpenGLInit( UINT version, const struct opengl_funcs *opengl_
+  * Android pseudo-device
+  */
+ 
+-extern void start_android_device(void);
+ extern void createDesktopView( int *event_source );
+ extern void register_native_window( HWND hwnd, struct ANativeWindow *win, BOOL client );
+ extern struct ANativeWindow *create_ioctl_window( HWND hwnd, BOOL opengl );
+@@ -139,6 +138,7 @@ extern void update_keyboard_lock_state( WORD vkey, UINT state );
+ 
+ /* JNI entry points */
+ extern void looper_init( JNIEnv *env, jobject obj );
++extern void wine_init_jni( JNIEnv *env, jobject obj );
+ extern void desktop_changed( JNIEnv *env, jobject obj, jint width, jint height );
+ extern void config_changed( JNIEnv *env, jobject obj, jint dpi );
+ extern void surface_changed( JNIEnv *env, jobject obj, jint win, jobject surface,
+@@ -196,8 +196,7 @@ union event_data
+ 
+ int send_event( const union event_data *data );
+ 
+-extern JavaVM *java_vm;
+-extern jobject java_object;
++extern int event_source;
+ 
+ /* string helpers */
+ 
+diff --git a/dlls/wineandroid.drv/device.c b/dlls/wineandroid.drv/device.c
+index 4ec48368901..cdfa7847454 100644
+--- a/dlls/wineandroid.drv/device.c
++++ b/dlls/wineandroid.drv/device.c
+@@ -73,6 +73,7 @@ static int log_flags;
+ WINE_DEFAULT_DEBUG_CHANNEL(android);
+ 
+ static int desktop_client_fd = -1;
++static jobject java_object;
+ 
+ #ifndef SYNC_IOC_WAIT
+ #define SYNC_IOC_WAIT _IOW('>', 0, __s32)
+@@ -867,17 +868,6 @@ static const ioctl_func ioctl_funcs[] =
+ static ALooper *looper;
+ static JNIEnv *looper_env; /* JNIEnv for the main thread looper. Must only be used from that thread. */
+ 
+-void looper_init( JNIEnv* env, jobject obj )
+-{
+-    looper_env = env;
+-    if (!(looper = pALooper_forThread()))
+-    {
+-        LOG( ERR, "No looper for current thread\n" );
+-        abort();
+-    }
+-    pALooper_acquire( looper );
+-}
+-
+ /* Handle a single ioctl request from a client socket.
+  * Returns 0 if a request was handled successfully and the caller may
+  * continue draining the socket, -1 if there is nothing more to read
+@@ -985,25 +975,19 @@ static int looper_handle_listen( int fd, int events, void *data )
+     return 1;
+ }
+ 
+-static void *bootstrap_looper_thread( void *arg )
++/* main Wine initialisation */
++void wine_init_jni( JNIEnv *env, jobject obj )
+ {
+-    JNIEnv *env;
+-    jmethodID method = NULL;
+-    jobject object = NULL;
+     int sockfd;
+ 
+-    if (!java_vm || (*java_vm)->AttachCurrentThread( java_vm, &env, 0 ) != JNI_OK)
+-    {
+-        LOG( ERR,  "Failed to attach current thread\n" );
+-        return NULL;
+-    }
+-
+-    if (!(object = load_java_method( env, &method, "obtainLooper", "()V" )))
++    java_object = (*env)->NewGlobalRef( env, obj );
++    looper_env = env;
++    if (!(looper = pALooper_forThread()))
+     {
+-        LOG( ERR,  "Failed to obtain looper\n" );
++        LOG( ERR, "No looper for current thread\n");
+         abort();
+     }
+-    (*env)->CallVoidMethod( env, object, method );
++    pALooper_acquire( looper );
+ 
+     sockfd = socket( AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0 );
+     if (sockfd < 0)
+@@ -1025,27 +1009,6 @@ static void *bootstrap_looper_thread( void *arg )
+         close(sockfd);
+         abort();
+     }
+-
+-    (*java_vm)->DetachCurrentThread( java_vm );
+-    return NULL;
+-}
+-
+-void start_android_device(void)
+-{
+-    pthread_t t;
+-
+-    /* Use a temporary bootstrap thread to request the main thread looper
+-     * without interfering with the current Wine/JVM execution context
+-     * (including register and thread-state assumptions). Actual ioctl
+-     * dispatch then runs from the main thread looper.
+-     */
+-    if (!pthread_create( &t, NULL, bootstrap_looper_thread, NULL ))
+-        pthread_join(t, NULL);
+-    else
+-    {
+-        LOG( ERR, "Failed to spawn looper bootstrap thread\n" );
+-        abort();
+-    }
+ }
+ 
+ 
+diff --git a/dlls/wineandroid.drv/init.c b/dlls/wineandroid.drv/init.c
+index 88565dd258d..df0cb2b72ec 100644
+--- a/dlls/wineandroid.drv/init.c
++++ b/dlls/wineandroid.drv/init.c
+@@ -26,6 +26,8 @@
+ 
+ #include "config.h"
+ 
++#include <fcntl.h>
++#include <unistd.h>
+ #include <stdarg.h>
+ #include <string.h>
+ #include <dlfcn.h>
+@@ -87,7 +89,7 @@ void init_monitors( int width, int height )
+            wine_dbgstr_rect( &rect ), wine_dbgstr_rect( &monitor_rc_work ));
+ 
+     /* if we're notified from Java thread, update registry */
+-    if (java_vm) NtUserCallNoParam( NtUserCallNoParam_DisplayModeChanged );
++    if (event_source != -1) NtUserCallNoParam( NtUserCallNoParam_DisplayModeChanged );
+ }
+ 
+ 
+@@ -171,7 +173,7 @@ void set_screen_dpi( DWORD dpi )
+  */
+ static void fetch_display_metrics(void)
+ {
+-    if (java_vm) return;  /* for Java threads it will be set when the top view is created */
++    if (event_source != -1) return;  /* for Java threads it will be set when the top view is created */
+ 
+     SERVER_START_REQ( get_window_rectangles )
+     {
+@@ -328,12 +330,12 @@ static const struct user_driver_funcs android_drv_funcs =
+ 
+ static const JNINativeMethod methods[] =
+ {
+-    { "wine_looper_init", "()V", looper_init },
+     { "wine_desktop_changed", "(II)V", desktop_changed },
+     { "wine_config_changed", "(I)V", config_changed },
+     { "wine_surface_changed", "(ILandroid/view/Surface;Z)V", surface_changed },
+     { "wine_motion_event", "(IIIIII)Z", motion_event },
+     { "wine_keyboard_event", "(IIII)Z", keyboard_event },
++    { "wine_init", "()V", wine_init_jni }
+ };
+ 
+ #define DECL_FUNCPTR(f) typeof(f) * p##f = NULL
+@@ -418,7 +420,6 @@ jint JNI_OnLoad( JavaVM *vm, void *reserved )
+ 
+     load_android_libs();
+ 
+-    java_vm = vm;
+     if ((*vm)->AttachCurrentThread( vm, &env, NULL ) != JNI_OK) return JNI_ERR;
+     if (!(class = (*env)->FindClass( env, WINE_JAVA_CLASS ))) return JNI_ERR;
+     (*env)->RegisterNatives( env, class, methods, ARRAY_SIZE( methods ));
+diff --git a/dlls/wineandroid.drv/window.c b/dlls/wineandroid.drv/window.c
+index 98a0e3dd066..db9294ee0d1 100644
+--- a/dlls/wineandroid.drv/window.c
++++ b/dlls/wineandroid.drv/window.c
+@@ -173,7 +173,7 @@ struct java_event
+ 
+ static struct list event_queue = LIST_INIT( event_queue );
+ static struct java_event *current_event;
+-static int event_source;
++int event_source = -1;
+ static DWORD desktop_tid;
+ 
+ extern int event_sink;
+@@ -1235,7 +1235,6 @@ BOOL has_client_surface( HWND hwnd )
+  */
+ BOOL ANDROID_CreateDesktop( const WCHAR *name, UINT width, UINT height )
+ {
+-    start_android_device();
+     createDesktopView( &event_source );
+     init_event_queue();
+     /* wait until we receive the surface changed event */
+-- 
+GitLab
+
