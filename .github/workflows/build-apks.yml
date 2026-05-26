@@ -67,26 +67,27 @@ jobs:
         with:
           path: ~/.cache/wine-packaging
           key: wine-android-downloads-v1
-
-      - name: Run build-apks script
-        run: |
-          chmod +x ./build-apks
-          ./build-apks ${{ github.event.inputs.release }}
-
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: wine-android-arm64-apk
-          path: "*.apk"
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Upload to GitHub Release
-        if: ${{ github.event.inputs.release != '' }}
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: wine-${{ github.event.inputs.release }}
-          files: "*.apk"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           
+- name: Run build-apks script
+  run: |
+    chmod +x ./build-apks
+    ./build-apks ${{ github.event.inputs.release }}
+    # APK dosyasını repository root'a taşı
+    mv $HOME/wine/packages/android/wine-*.apk . || true
+
+- name: Upload APK artifact
+  uses: actions/upload-artifact@v4
+  with:
+    name: wine-android-arm64-apk
+    path: "wine-*.apk"
+    if-no-files-found: error
+    retention-days: 30
+
+- name: Upload to GitHub Release
+  if: ${{ github.event.inputs.release != '' }}
+  uses: softprops/action-gh-release@v2
+  with:
+    tag_name: wine-${{ github.event.inputs.release }}
+    files: "wine-*.apk"
+  env:
+    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
