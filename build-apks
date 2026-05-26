@@ -259,7 +259,14 @@ apply_patches ()
     for patchfile in $patchlist; do
         patchname=$(basename "$patchfile")
         echo "Applying $patchname ..."
-        (cd wine && git apply "$patchfile") || { echo "ERROR: $patchname failed to apply, aborting."; exit 1; }
+        case "$patchname" in
+            desktop1.patch|desktop2.patch)
+                (cd wine && patch -p1 < "$patchfile") || { echo "ERROR: $patchname failed to apply, aborting."; exit 1; }
+                ;;
+            *)
+                (cd wine && git apply "$patchfile") || { echo "ERROR: $patchname failed to apply, aborting."; exit 1; }
+                ;;
+        esac
     done
 }
 
