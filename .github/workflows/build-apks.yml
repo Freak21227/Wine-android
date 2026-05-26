@@ -19,13 +19,13 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v4.7.1
         with:
-         java-version: '17'
-         distribution: 'temurin'
+          java-version: '17'
+          distribution: 'temurin'
 
       - name: Add deb-src to sources.list
         run: |
@@ -63,7 +63,7 @@ jobs:
           sudo apt-get build-dep wine -y || true
 
       - name: Cache downloaded archives
-        uses: actions/cache@v4
+        uses: actions/cache@v4.2.3
         with:
           path: ~/.cache/wine-packaging
           key: wine-android-downloads-v1
@@ -72,11 +72,10 @@ jobs:
         run: |
           chmod +x ./build-apks
           ./build-apks ${{ github.event.inputs.release }}
-          # APK dosyasını repository root'a taşı
           mv $HOME/wine/packages/android/wine-*.apk . || true
 
       - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: wine-android-arm64-apk
           path: "wine-*.apk"
