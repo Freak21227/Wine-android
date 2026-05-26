@@ -236,6 +236,10 @@ if (cd wine && git apply --check "$sourcedir/posix_spawn.patch")
 then
     (cd wine && git apply "$sourcedir/posix_spawn.patch")
 fi
+if (cd wine && git apply --check "$sourcedir/sqlite3.patch")
+then
+    (cd wine && git apply "$sourcedir/sqlite3.patch")
+fi
 test -d $winetools || config_wine_tools
 
 arch=arm64
