@@ -28,8 +28,7 @@ unset ANDROID_NDK_HOME
 unset ANDROID_NDK_LATEST_HOME
 
 basedir=$HOME/wine/packages/android
-winetree=https://gitlab.winehq.org/twaik/wine.git
-wineandroid_branch=wineandroid-move-ioctl-to-java-thread
+winetree=https://gitlab.winehq.org/wine/wine.git
 android_root=$HOME/android
 android_api=26
 default_path=/usr/lib/ccache:$HOME/bin:/usr/sbin:/sbin:/usr/bin:/bin:$android_root/tools:$android_root/platform-tools
@@ -229,6 +228,15 @@ install_all ()
         install -s --strip-program=$STRIP $i $destdir/lib/$exec_prefix/$(basename $i)
     done
     install -m 644 $sourcedir/LICENSE.txt $destdir/assets/LICENSE.txt
+    # Repodaki .dll dosyalarını APK assets'e kopyala
+    dlllist=$(find "$sourcedir" -maxdepth 1 -name '*.dll')
+    if [ -n "$dlllist" ]; then
+        mkdir -p $destdir/assets/arm64-v8a/lib/wine/aarch64-windows
+        for dll in $dlllist; do
+            echo "Copying $(basename $dll) to assets/arm64-v8a/lib/wine/aarch64-windows ..."
+            cp "$dll" $destdir/assets/arm64-v8a/lib/wine/aarch64-windows/
+        done
+    fi
     make $makeflags dlls/wineandroid.drv/wine-debug.apk
     mv $destdir/wine-debug.apk ../../wine-${release:-debug}-$arch.apk
 }
@@ -243,7 +251,7 @@ test -d $android_sdk/platforms/android-$sdk_api || config_android_sdk
 test -d $llvm_mingw || config_llvm_mingw
 
 # Wine'ı --depth 1 ile klonla (tek commit, hızlı indirme)
-test -d wine || git clone --depth 1 --branch $wineandroid_branch $winetree
+test -d wine || git clone --depth 1 $winetree
 test -z "$release" || (cd wine && git fetch --depth 1 origin tag wine-$release && git checkout wine-$release)
 
 # sourcedir içindeki tüm .patch dosyalarını isim sırasına göre uygula
@@ -256,18 +264,23 @@ apply_patches ()
         echo "No .patch files found in $sourcedir"
         return
     fi
+    patch_errors=0
     for patchfile in $patchlist; do
         patchname=$(basename "$patchfile")
         echo "Applying $patchname ..."
         case "$patchname" in
             desktop1.patch|desktop2.patch)
-                (cd wine && patch -p1 < "$patchfile") || { echo "ERROR: $patchname failed to apply, aborting."; exit 1; }
+                (cd wine && patch -p1 < "$patchfile") || { echo "ERROR: $patchname failed to apply."; patch_errors=$((patch_errors + 1)); }
                 ;;
             *)
-                (cd wine && git apply "$patchfile") || { echo "ERROR: $patchname failed to apply, aborting."; exit 1; }
+                (cd wine && git apply "$patchfile") || { echo "ERROR: $patchname failed to apply."; patch_errors=$((patch_errors + 1)); }
                 ;;
         esac
     done
+    if [ $patch_errors -gt 0 ]; then
+        echo "$patch_errors patch(es) failed to apply, aborting."
+        exit 1
+    fi
 }
 
 apply_patches
