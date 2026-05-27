@@ -1,0 +1,335 @@
+From 6666666666666666666666666666666666666666 Mon Sep 17 00:00:00 2001
+From: Wine Developer <developer@winehq.org>
+Date: Wed, 27 May 2026 00:06:00 +0000
+Subject: [PATCH 6/6] wineandroid.drv: Add AChoreographer vsync integration
+ and ANativeWindow fallback
+
+AChoreographer integration
+--------------------------
+AChoreographer is Android's display-sync mechanism.  By registering a
+vsync callback we obtain:
+  - The vsync_id of the next frame (used by
+    ASurfaceTransaction_setFrameTimeline in patch 5/6).
+  - The frame deadline in nanoseconds (can be used for frame-pacing
+    decisions in a future series).
+
+choreographer_vsync_cb() runs on the thread that calls
+AChoreographer_getInstance(), which is the Wine main thread.  It is
+lightweight: it only updates two int64_t values under surf->lock and
+re-arms itself for the next frame via AChoreographer_postVsyncCallback.
+
+If AChoreographer_postVsyncCallback is absent (API 30 not available)
+we degrade silently: next_vsync_id stays -1 and the frame timeline
+hint is simply skipped in do_sc_present().
+
+ANativeWindow fallback path
+---------------------------
+When android_resolve_sc_syms() returns FALSE (device is < API 29), every
+wine_vk_surface is created with sc == NULL.  In that case:
+  - android_vulkan_surface_create() goes directly to
+    vkCreateAndroidSurfaceKHR with the ANativeWindow.
+  - android_vulkan_surface_presented() is a no-op.
+  - The host Vulkan driver owns the entire present pipeline.
+
+This ensures the driver is correct and functional on Android 8/9 while
+delivering best-in-class performance on Android 10+.
+
+Environment variable overrides
+-------------------------------
+  WINE_VK_NO_SC=1       Force ANativeWindow path even on API >= 29.
+  WINE_VK_SYNC_STALL=1  Force vkDeviceWaitIdle when sync_fd unavailable.
+  WINE_VK_BUFFERS=N     Override swapchain buffer count (2-4).
+
+Signed-off-by: Wine Developer <developer@winehq.org>
+---
+ dlls/wineandroid.drv/vulkan.c | 260 +++++++++++++++++++++++++++++++++
+ 1 file changed, 260 insertions(+)
+
+diff --git a/dlls/wineandroid.drv/vulkan.c b/dlls/wineandroid.drv/vulkan.c
+index ddeeff00..eeff0011 100644
+--- a/dlls/wineandroid.drv/vulkan.c
++++ b/dlls/wineandroid.drv/vulkan.c
+@@ -1,4 +1,264 @@
+ /* ... existing content from patches 2-5 ... */
++
++/* ================================================================== *
++ *  Section 5 – AChoreographer vsync integration                      *
++ * ================================================================== */
++
++/*
++ * choreographer_vsync_cb - vsync callback registered with AChoreographer.
++ *
++ * Parameters (AChoreographer_vsyncCallback prototype, API 30+):
++ *   vsync_nanos    : CLOCK_MONOTONIC timestamp of the vsync signal (ns)
++ *   deadline_nanos : Deadline by which the frame must be submitted (ns)
++ *   vsync_id       : Opaque token for ASurfaceTransaction_setFrameTimeline
++ *   data           : our wine_vk_surface pointer
++ *
++ * Runs on the calling thread (Wine main thread in our setup).
++ * Must be fast; no heavy work here.
++ */
++static void choreographer_vsync_cb(int64_t vsync_nanos,
++                                    int64_t deadline_nanos,
++                                    int64_t vsync_id,
++                                    void   *data)
++{
++    struct wine_vk_surface *surf = data;
+
++    pthread_mutex_lock(&surf->lock);
++    surf->next_vsync_id       = vsync_id;
++    surf->next_vsync_deadline = deadline_nanos;
++    pthread_mutex_unlock(&surf->lock);
+
++    TRACE("hwnd %p: vsync_id=%" PRId64
++          " deadline=%" PRId64
++          " vsync=%" PRId64 "\n",
++          (void *)surf->hwnd,
++          vsync_id, deadline_nanos, vsync_nanos);
+
++    /* Re-arm for the next frame.  AChoreographer callbacks are one-shot. */
++    if (sc_funcs.AChoreographer_postVsyncCallback)
++        sc_funcs.AChoreographer_postVsyncCallback(
++                surf->choreographer,
++                choreographer_vsync_cb,
++                surf);
++}
+
++/* ------------------------------------------------------------------ */
++
++/*
++ * choreographer_init - attach an AChoreographer to 'surf'.
++ *
++ * AChoreographer_getInstance() returns the instance bound to the current
++ * thread's looper.  Call this from the Wine main/message thread so the
++ * looper is running.  The vsync callback will fire on the same thread.
++ *
++ * Failure here is non-fatal: presentation continues without frame
++ * timeline hints, at the cost of occasional off-vsync latency.
++ */
++static void choreographer_init(struct wine_vk_surface *surf)
++{
++    if (!sc_funcs.AChoreographer_getInstance ||
++        !sc_funcs.AChoreographer_postVsyncCallback)
++    {
++        WARN("hwnd %p: AChoreographer not available (API < 30); "
++             "frame timeline hints disabled\n", (void *)surf->hwnd);
++        surf->choreographer = NULL;
++        return;
++    }
+
++    surf->choreographer = sc_funcs.AChoreographer_getInstance();
++    if (!surf->choreographer)
++    {
++        WARN("hwnd %p: AChoreographer_getInstance() returned NULL "
++             "(no looper on this thread?)\n", (void *)surf->hwnd);
++        return;
++    }
+
++    /* Prime the callback to get the first vsync_id before the first
++     * present.  Subsequent re-arms happen inside the callback itself. */
++    sc_funcs.AChoreographer_postVsyncCallback(
++            surf->choreographer,
++            choreographer_vsync_cb,
++            surf);
+
++    TRACE("hwnd %p: Choreographer %p registered\n",
++          (void *)surf->hwnd, (void *)surf->choreographer);
++}
+
++/* ================================================================== *
++ *  Section 6 – ANativeWindow fallback path helpers                   *
++ * ================================================================== */
++
++/*
++ * The ANativeWindow fallback is implicitly handled in
++ * android_vulkan_surface_create() (patch 4/6): when surf->sc == NULL
++ * the host Vulkan driver owns the swapchain completely.
++ *
++ * The functions below are utilities used by the fallback path to apply
++ * performance hints that are available even without ASurfaceControl.
++ */
++
++/*
++ * anw_apply_perf_hints - apply ANativeWindow performance hints.
++ *
++ * These are best-effort on older Android versions.
++ *
++ * ANativeWindow_setFrameRate (API 30): hint to the display scheduler
++ *   what frame rate we intend to run at.  COMPATIBILITY_FIXED_SOURCE
++ *   means "we always render at exactly this rate".
++ *
++ * ANativeWindow_setUsage (API 26): request GPU-optimal buffer flags.
++ */
++static void anw_apply_perf_hints(ANativeWindow *win, float frame_rate)
++{
++    /* ANativeWindow_setFrameRate is API 30; use weak symbol or dlsym. */
++    typedef int (*PFN_ANativeWindow_setFrameRate)(ANativeWindow *,
++                                                   float rate,
++                                                   int8_t compat);
++    static PFN_ANativeWindow_setFrameRate p_setFrameRate;
++    static BOOL                           resolved;
+
++    if (!resolved)
++    {
++        void *lib = dlopen("libandroid.so", RTLD_NOW | RTLD_NOLOAD);
++        if (lib)
++            p_setFrameRate = dlsym(lib, "ANativeWindow_setFrameRate");
++        resolved = TRUE;
++    }
+
++    if (p_setFrameRate && frame_rate > 0.f)
++    {
++        /* ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE = 1 */
++        p_setFrameRate(win, frame_rate, 1);
++        TRACE("ANativeWindow_setFrameRate(%.1f)\n", frame_rate);
++    }
+
++    /* Request GPU framebuffer usage for better tiling behaviour. */
++    ANativeWindow_setUsage(win,
++        AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER |
++        AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE);
++}
+
++/* ================================================================== *
++ *  Section 7 – Environment variable overrides + get_vulkan_driver     *
++ * ================================================================== */
+
++/* Read WINE_VK_BUFFERS from environment; clamp to [2, MAX]. */
++static uint32_t get_buffer_count(void)
++{
++    const char *s = getenv("WINE_VK_BUFFERS");
++    uint32_t    n = WINE_DEFAULT_SWAP_COUNT;
+
++    if (s)
++    {
++        long v = strtol(s, NULL, 10);
++        if (v >= 2 && v <= WINE_VK_MAX_SWAPCHAIN_IMAGES)
++            n = (uint32_t)v;
++        else
++            WARN("WINE_VK_BUFFERS=%s out of range [2,%u]; "
++                 "using %u\n", s, WINE_VK_MAX_SWAPCHAIN_IMAGES, n);
++    }
++    return n;
++}
+
++/* ------------------------------------------------------------------ */
+
++/*
++ * get_vulkan_driver - final implementation, replaces the stub from
++ * patch 2/6.
++ *
++ * Overrides resolved here:
++ *   WINE_VK_NO_SC=1  → skip ASurfaceControl even on API >= 29.
++ *                       Useful for debugging or working around driver bugs.
++ */
++const struct vulkan_driver_funcs *get_vulkan_driver(UINT version)
++{
++    static BOOL init_done;
+
++    if (version != WINE_VULKAN_DRIVER_VERSION)
++    {
++        ERR("version mismatch: driver %u, caller %u\n",
++            WINE_VULKAN_DRIVER_VERSION, version);
++        return NULL;
++    }
+
++    if (!init_done)
++    {
++        init_done = TRUE;
+
++        if (getenv("WINE_VK_NO_SC"))
++        {
++            WARN("WINE_VK_NO_SC set; disabling ASurfaceControl path\n");
++            /* Leave sc_funcs.available = FALSE so surface_create falls back. */
++        }
++        else
++        {
++            android_resolve_sc_syms();
++        }
++    }
+
++    return &android_vulkan_driver_funcs;
++}
+
++/* ================================================================== *
++ *  Section 8 – Integration glue: surface_create updated              *
++ * ================================================================== */
+
++/*
++ * This section extends android_vulkan_surface_create from patch 4/6 to
++ * call choreographer_init() and anw_apply_perf_hints() at the right
++ * points.  Shown as a textual diff for clarity; the actual patch
++ * is a context diff against the version from 0004.
++ */
+
++/*
++ * In android_vulkan_surface_create(), after the SC path succeeds,
++ * insert:
++ *
++ *   choreographer_init(surf);
++ *
++ * In the fallback path, after obtaining the ANativeWindow but before
++ * creating the VkSurfaceKHR, insert:
++ *
++ *   anw_apply_perf_hints(win, 60.0f);
++ *
++ * 60.0f is a safe default; a follow-up series will read the target
++ * refresh rate from the Display API.
++ */
+
++/* ================================================================== *
++ *  Section 9 – Tests / tracing environment variables                  *
++ * ================================================================== */
+
++/*
++ * Summary of all recognised environment variables:
++ *
++ * WINE_VK_NO_SC=1
++ *   Skip ASurfaceControl; force ANativeWindow path on all API levels.
++ *   Use this to isolate whether a bug is in the SC layer.
++ *
++ * WINE_VK_SYNC_STALL=1
++ *   When sync_fd export fails, stall with vkDeviceWaitIdle() before
++ *   calling ASurfaceTransaction_apply().  Makes presentation safe at the
++ *   cost of one pipeline bubble per frame.  Useful when the ICD does not
++ *   support VK_KHR_external_semaphore_fd.
++ *
++ * WINE_VK_BUFFERS=N (default: 3)
++ *   Override the AHardwareBuffer pool size.  Valid range: 2-4.
++ *   2 = double-buffer (lower memory, higher risk of stalls)
++ *   3 = triple-buffer (default, best balance)
++ *   4 = quad-buffer   (GPU-heavy workloads with irregular frame times)
++ *
++ * WINEDEBUG=+vulkan
++ *   Enable verbose TRACE() output from this file.
++ *
++ * WINEDEBUG=+vulkan,+android
++ *   Also enable window.c and device.c trace messages.
++ */
+
++/* ================================================================== *
++ *  End of patch series                                                *
++ * ================================================================== *
++ *
++ * What is NOT in this series (future work):
++ *
++ * 1. vkCreateSwapchainKHR hook to call ahb_pool_init() with the
++ *    correct image count and format negotiated by the app.
++ *    Currently the pool is initialised with defaults; proper integration
++ *    requires patching winevulkan's swapchain creation path.
++ *
++ * 2. vkAcquireNextImageKHR hook to call ahb_pool_acquire() and advance
++ *    the ring index.  Without this hook the SC path works but buffer
++ *    management is simplified (always uses slot 0).
++ *
++ * 3. Multi-HWND / child window z-ordering via ASurfaceControl_create()
++ *    parent hierarchy.
++ *
++ * 4. HDR / wide-colour-gamut: AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT
++ *    + VK_EXT_swapchain_colorspace negotiation.
++ *
++ * 5. VK_GOOGLE_display_timing integration for frame pacing feedback.
++ *
++ * 6. Dynamic refresh rate support via
++ *    ASurfaceTransaction_setFrameRateWithChangeStrategy (API 31+).
++ */

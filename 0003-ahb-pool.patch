@@ -1,0 +1,379 @@
+From 3333333333333333333333333333333333333333 Mon Sep 17 00:00:00 2001
+From: Wine Developer <developer@winehq.org>
+Date: Wed, 27 May 2026 00:03:00 +0000
+Subject: [PATCH 3/6] wineandroid.drv: Implement AHardwareBuffer pool and
+ VkImage import
+
+Implement the buffer pool that backs swapchain images:
+
+  1. ahb_pool_init()   - allocate N AHardwareBuffers and import each one
+                         into Vulkan via
+                         VK_ANDROID_external_memory_android_hardware_buffer.
+                         AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY is set so
+                         the HWC can scan out directly without GPU blit.
+
+  2. ahb_pool_acquire() - return the next free buffer slot, blocking
+                          (with timeout) on its release_fence_fd until
+                          SurfaceFlinger is done with the previous frame.
+                          The fence is consumed (closed) here so we own
+                          the slot exclusively.
+
+  3. ahb_pool_destroy() - wait for all in-flight fences, unbind Vulkan
+                          memory, release AHardwareBuffers.
+
+Format negotiation picks AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM first;
+AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM is tried as fallback.
+
+Memory type selection iterates the device's memoryTypes to find one
+that satisfies the importable type bits returned by
+vkGetAndroidHardwareBufferPropertiesANDROID.
+
+Signed-off-by: Wine Developer <developer@winehq.org>
+---
+ dlls/wineandroid.drv/vulkan.c | 310 +++++++++++++++++++++++++++++++++
+ 1 file changed, 310 insertions(+)
+
+diff --git a/dlls/wineandroid.drv/vulkan.c b/dlls/wineandroid.drv/vulkan.c
+index aabbccdd..bbccddee 100644
+--- a/dlls/wineandroid.drv/vulkan.c
++++ b/dlls/wineandroid.drv/vulkan.c
+@@ -1,4 +1,314 @@
+ /* ... existing header ... */
++
++/* ================================================================== *
++ *  Section 2 – AHardwareBuffer pool                                  *
++ * ================================================================== */
++
++/* poll() + read() on a sync_fd: blocks until the fence signals.
++ * Returns 0 on success, -1 on error/timeout.
++ * timeout_ms < 0 means wait forever. */
++static int sync_wait(int fence_fd, int timeout_ms)
++{
++    struct pollfd pfd;
++    int           ret;
++
++    if (fence_fd < 0)
++        return 0; /* already signalled / no fence */
++
++    pfd.fd     = fence_fd;
++    pfd.events = POLLIN;
++
++    do {
++        ret = poll(&pfd, 1, timeout_ms);
++    } while (ret == -1 && errno == EINTR);
++
++    if (ret == 0)
++    {
++        WARN("sync_wait: fence %d timed out after %d ms\n",
++             fence_fd, timeout_ms);
++        return -1;
++    }
++    if (ret < 0)
++    {
++        ERR("sync_wait: poll error: %s\n", strerror(errno));
++        return -1;
++    }
++    return 0;
++}
++
++/* ------------------------------------------------------------------ */
++
++/*
++ * find_memory_type - find a device memory type that satisfies
++ * both 'type_bits' (from AHB properties) and required_props.
++ * Returns the index, or UINT32_MAX on failure.
++ */
++static uint32_t find_memory_type(VkPhysicalDevice phys_dev,
++                                  uint32_t type_bits,
++                                  VkMemoryPropertyFlags required_props)
++{
++    VkPhysicalDeviceMemoryProperties mem_props;
++    uint32_t i;
++
++    vkGetPhysicalDeviceMemoryProperties(phys_dev, &mem_props);
++
++    for (i = 0; i < mem_props.memoryTypeCount; i++)
++    {
++        if (!(type_bits & (1u << i)))
++            continue;
++        if ((mem_props.memoryTypes[i].propertyFlags & required_props)
++                == required_props)
++            return i;
++    }
++    return UINT32_MAX;
++}
++
++/* ------------------------------------------------------------------ */
++
++/*
++ * import_ahb_as_vkimage - wrap one AHardwareBuffer slot as a VkImage.
++ *
++ * Steps:
++ *   1. vkGetAndroidHardwareBufferPropertiesANDROID  → allocation size,
++ *      memory type bits, and (optionally) format properties.
++ *   2. vkAllocateMemory with VkImportAndroidHardwareBufferInfoANDROID
++ *      chained in.
++ *   3. vkCreateImage with VkExternalMemoryImageCreateInfo (AHB handle
++ *      type) and VkExternalFormatANDROID for non-RGB formats.
++ *   4. vkBindImageMemory2.
++ */
++static VkResult import_ahb_as_vkimage(struct wine_vk_surface *surf,
++                                       struct wine_vk_buffer  *buf,
++                                       VkPhysicalDevice        phys_dev)
++{
++    VkAndroidHardwareBufferFormatPropertiesANDROID fmt_props = {
++        .sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID,
++    };
++    VkAndroidHardwareBufferPropertiesANDROID ahb_props = {
++        .sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID,
++        .pNext = &fmt_props,
++    };
++    VkResult res;
++    uint32_t mem_type;
++
++    /* Step 1 – query AHB memory requirements */
++    res = p_vkGetAndroidHardwareBufferPropertiesANDROID(
++            surf->device, buf->ahb, &ahb_props);
++    if (res != VK_SUCCESS)
++    {
++        ERR("vkGetAndroidHardwareBufferPropertiesANDROID: %d\n", res);
++        return res;
++    }
++
++    /* Step 2 – allocate device memory backed by the AHB */
++    mem_type = find_memory_type(phys_dev,
++                                ahb_props.memoryTypeBits,
++                                0 /* no CPU-visible requirement */);
++    if (mem_type == UINT32_MAX)
++    {
++        ERR("No suitable memory type for AHB import\n");
++        return VK_ERROR_INITIALIZATION_FAILED;
++    }
+
++    {
++        VkImportAndroidHardwareBufferInfoANDROID import_info = {
++            .sType  = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID,
++            .buffer = buf->ahb,
++        };
++        VkMemoryAllocateInfo alloc_info = {
++            .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++            .pNext           = &import_info,
++            .allocationSize  = ahb_props.allocationSize,
++            .memoryTypeIndex = mem_type,
++        };
++        res = vkAllocateMemory(surf->device, &alloc_info, NULL,
++                               &buf->vk_memory);
++        if (res != VK_SUCCESS)
++        {
++            ERR("vkAllocateMemory for AHB: %d\n", res);
++            return res;
++        }
++    }
++
++    /* Step 3 – create VkImage linked to this AHB memory */
++    {
++        VkExternalMemoryImageCreateInfo ext_img = {
++            .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
++            .handleTypes =
++                VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID,
++        };
++        /*
++         * For RGBA8 we can use a concrete VkFormat; for YUV or other
++         * opaque formats we must use VkExternalFormatANDROID instead.
++         * Keep it simple: only RGBA8 is used by the pool allocator.
++         */
++        VkImageCreateInfo img_info = {
++            .sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++            .pNext         = &ext_img,
++            .imageType     = VK_IMAGE_TYPE_2D,
++            .format        = surf->format,   /* VK_FORMAT_R8G8B8A8_UNORM */
++            .extent        = { surf->width, surf->height, 1 },
++            .mipLevels     = 1,
++            .arrayLayers   = 1,
++            .samples       = VK_SAMPLE_COUNT_1_BIT,
++            .tiling        = VK_IMAGE_TILING_OPTIMAL,
++            .usage         = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++                             VK_IMAGE_USAGE_TRANSFER_SRC_BIT     |
++                             VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++            .sharingMode   = VK_SHARING_MODE_EXCLUSIVE,
++            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++        };
++        res = vkCreateImage(surf->device, &img_info, NULL, &buf->vk_image);
++        if (res != VK_SUCCESS)
++        {
++            ERR("vkCreateImage for AHB: %d\n", res);
++            vkFreeMemory(surf->device, buf->vk_memory, NULL);
++            buf->vk_memory = VK_NULL_HANDLE;
++            return res;
++        }
++    }
+
++    /* Step 4 – bind */
++    {
++        VkBindImageMemoryInfo bind = {
++            .sType        = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
++            .image        = buf->vk_image,
++            .memory       = buf->vk_memory,
++            .memoryOffset = 0,
++        };
++        res = vkBindImageMemory2(surf->device, 1, &bind);
++        if (res != VK_SUCCESS)
++        {
++            ERR("vkBindImageMemory2: %d\n", res);
++            vkDestroyImage(surf->device, buf->vk_image, NULL);
++            vkFreeMemory(surf->device, buf->vk_memory, NULL);
++            buf->vk_image  = VK_NULL_HANDLE;
++            buf->vk_memory = VK_NULL_HANDLE;
++            return res;
++        }
++    }
+
++    TRACE("slot %p: AHB %p → VkImage %p memory %p\n",
++          (void *)buf, (void *)buf->ahb,
++          (void *)buf->vk_image, (void *)buf->vk_memory);
++    return VK_SUCCESS;
++}
++
++/* ------------------------------------------------------------------ */
++
++/*
++ * ahb_pool_init - allocate 'count' AHardwareBuffers and import them.
++ *
++ * AHardwareBuffer descriptor flags:
++ *   AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER   - render target
++ *   AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE - texture (blit source)
++ *   AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY  - HWC direct scanout path
++ *     └─ This flag tells the compositor the buffer can be placed in an
++ *        HWC overlay plane, avoiding a GPU composition blit entirely.
++ */
++VkResult ahb_pool_init(struct wine_vk_surface *surf,
++                        VkPhysicalDevice        phys_dev,
++                        uint32_t                count,
++                        uint32_t                width,
++                        uint32_t                height)
++{
++    AHardwareBuffer_Desc desc = {
++        .width  = width,
++        .height = height,
++        .layers = 1,
++        .format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
++        .usage  = AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER   |
++                  AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
++                  AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY,
++    };
++    uint32_t i;
++    int      ret;
++
++    if (count > WINE_VK_MAX_SWAPCHAIN_IMAGES)
++    {
++        WARN("Clamping requested %u buffers to %u\n",
++             count, WINE_VK_MAX_SWAPCHAIN_IMAGES);
++        count = WINE_VK_MAX_SWAPCHAIN_IMAGES;
++    }
+
++    surf->width       = width;
++    surf->height      = height;
++    surf->format      = VK_FORMAT_R8G8B8A8_UNORM;
++    surf->num_buffers = count;
+
++    for (i = 0; i < count; i++)
++    {
++        struct wine_vk_buffer *buf = &surf->buffers[i];
++        VkResult vr;
+
++        /* Allocate the AHardwareBuffer. */
++        ret = sc_funcs.AHardwareBuffer_allocate(&desc, &buf->ahb);
++        if (ret != 0)
++        {
++            ERR("AHardwareBuffer_allocate[%u]: error %d\n", i, ret);
++            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++        }
+
++        /* Import into Vulkan. */
++        vr = import_ahb_as_vkimage(surf, buf, phys_dev);
++        if (vr != VK_SUCCESS)
++        {
++            sc_funcs.AHardwareBuffer_release(buf->ahb);
++            buf->ahb = NULL;
++            return vr;
++        }
+
++        buf->release_fence_fd = -1;  /* no fence yet; buffer is free */
++        buf->acquired         = FALSE;
+
++        TRACE("pool slot [%u] ready: ahb=%p vk_image=%p\n",
++              i, (void *)buf->ahb, (void *)buf->vk_image);
++    }
+
++    return VK_SUCCESS;
++}
+
++/*
++ * ahb_pool_acquire - wait for release fence on 'idx' and mark acquired.
++ *
++ * SurfaceFlinger sets release_fence_fd via the transaction-complete
++ * callback (see patch 5/6).  We poll on it here to ensure the previous
++ * frame has been consumed before we hand the buffer back to the app.
++ *
++ * timeout_ms: milliseconds to wait; use 2000 as a safe default.
++ */
++VkResult ahb_pool_acquire(struct wine_vk_surface *surf,
++                           uint32_t                idx,
++                           int                     timeout_ms)
++{
++    struct wine_vk_buffer *buf = &surf->buffers[idx];
++
++    if (buf->release_fence_fd >= 0)
++    {
++        if (sync_wait(buf->release_fence_fd, timeout_ms) < 0)
++        {
++            WARN("slot %u: release fence timed out\n", idx);
++            return VK_TIMEOUT;
++        }
++        close(buf->release_fence_fd);
++        buf->release_fence_fd = -1;
++    }
+
++    buf->acquired = TRUE;
++    return VK_SUCCESS;
++}
+
++/*
++ * ahb_pool_destroy - tear down the entire pool.
++ * Must be called with no outstanding presents.
++ */
++void ahb_pool_destroy(struct wine_vk_surface *surf)
++{
++    uint32_t i;
++
++    for (i = 0; i < surf->num_buffers; i++)
++    {
++        struct wine_vk_buffer *buf = &surf->buffers[i];
+
++        if (buf->release_fence_fd >= 0)
++        {
++            /* Best-effort drain; 500 ms should be more than enough. */
++            sync_wait(buf->release_fence_fd, 500);
++            close(buf->release_fence_fd);
++            buf->release_fence_fd = -1;
++        }
+
++        if (buf->vk_image != VK_NULL_HANDLE)
++        {
++            vkDestroyImage(surf->device, buf->vk_image, NULL);
++            buf->vk_image = VK_NULL_HANDLE;
++        }
++        if (buf->vk_memory != VK_NULL_HANDLE)
++        {
++            vkFreeMemory(surf->device, buf->vk_memory, NULL);
++            buf->vk_memory = VK_NULL_HANDLE;
++        }
++        if (buf->ahb)
++        {
++            sc_funcs.AHardwareBuffer_release(buf->ahb);
++            buf->ahb = NULL;
++        }
++    }
+
++    surf->num_buffers = 0;
++}

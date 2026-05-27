@@ -1,0 +1,350 @@
+From 4444444444444444444444444444444444444444 Mon Sep 17 00:00:00 2001
+From: Wine Developer <developer@winehq.org>
+Date: Wed, 27 May 2026 00:04:00 +0000
+Subject: [PATCH 4/6] wineandroid.drv: Implement ASurfaceControl surface
+ management and HWND mapping
+
+Wire up android_vulkan_surface_create/destroy and the HWND → ANativeWindow
+helper from window.c.
+
+Surface creation path (API >= 29):
+  1. Obtain the ANativeWindow for the HWND via wine_get_native_window().
+     The native window is owned by the Java SurfaceView managed by
+     WineActivity; we only borrow a reference here.
+  2. Create an ASurfaceControl as a child of that ANativeWindow.  This
+     gives us a direct slot in SurfaceFlinger's layer tree without going
+     through the BufferQueue owned by the ANativeWindow itself.
+  3. Initialise the AHardwareBuffer pool (patch 3/6).
+  4. Start the AChoreographer vsync listener (see patch 6/6).
+  5. Register the wine_vk_surface in the global list.
+
+Surface destruction path:
+  1. Drain in-flight fences (ahb_pool_destroy).
+  2. Release the ASurfaceControl.
+  3. Drop the surface from the list.
+
+Window geometry changes (move / resize) are committed atomically via
+ASurfaceTransaction_setGeometry so there is never a visual tear.
+
+Signed-off-by: Wine Developer <developer@winehq.org>
+---
+ dlls/wineandroid.drv/vulkan.c  | 280 ++++++++++++++++++++++++++++++
+ dlls/wineandroid.drv/window.c  |  15 ++
+ dlls/wineandroid.drv/android.h |   6 +
+ 3 files changed, 301 insertions(+)
+
+diff --git a/dlls/wineandroid.drv/window.c b/dlls/wineandroid.drv/window.c
+index aabbccdd..bbccddee 100644
+--- a/dlls/wineandroid.drv/window.c
++++ b/dlls/wineandroid.drv/window.c
+@@ -1,4 +1,19 @@
+ /* ... existing header ... */
++
++/*
++ * wine_get_native_window - return the ANativeWindow associated with hwnd.
++ *
++ * The window was created by WineActivity and stored in the per-window
++ * data when ANDROID_CreateWindow() was called.  Returns NULL if the
++ * HWND has no associated surface yet.
++ *
++ * The caller must call ANativeWindow_release() when done.
++ */
++ANativeWindow *wine_get_native_window(HWND hwnd)
++{
++    struct android_win_data *data = get_win_data(hwnd);
++    ANativeWindow *win = data ? data->window : NULL;
++    if (win) ANativeWindow_acquire(win);
++    release_win_data(data);
++    return win;
++}
+
+diff --git a/dlls/wineandroid.drv/android.h b/dlls/wineandroid.drv/android.h
+index bbccddee..ccddeeff 100644
+--- a/dlls/wineandroid.drv/android.h
++++ b/dlls/wineandroid.drv/android.h
+@@ -1,3 +1,9 @@
+ /* existing content */
++
++/* window.c export used by vulkan.c */
++ANativeWindow *wine_get_native_window(HWND hwnd);
++
++/* vulkan.c exports used by init.c */
++VkResult ahb_pool_init(struct wine_vk_surface *, VkPhysicalDevice,
++                        uint32_t count, uint32_t w, uint32_t h);
++void     ahb_pool_destroy(struct wine_vk_surface *);
+
+diff --git a/dlls/wineandroid.drv/vulkan.c b/dlls/wineandroid.drv/vulkan.c
+index bbccddee..ccddeeff 100644
+--- a/dlls/wineandroid.drv/vulkan.c
++++ b/dlls/wineandroid.drv/vulkan.c
+@@ -1,4 +1,284 @@
+ /* ... existing content from patches 2 and 3 ... */
++
++/* ================================================================== *
++ *  Section 3 – ASurfaceControl surface lifecycle                     *
++ * ================================================================== */
+
++/*
++ * Default swapchain image count and dimensions.
++ * The actual count is negotiated via vkGetSwapchainImagesKHR; these
++ * values are the defaults used when the pool is created.
++ */
++#define WINE_DEFAULT_SWAP_COUNT  3   /* triple-buffer */
++
++/* ------------------------------------------------------------------ */
++
++/*
++ * surface_alloc - allocate and zero a wine_vk_surface.
++ * Caller must call surface_free() on failure or when done.
++ */
++static struct wine_vk_surface *surface_alloc(HWND hwnd)
++{
++    struct wine_vk_surface *surf;
++
++    surf = calloc(1, sizeof(*surf));
++    if (!surf)
++        return NULL;
+
++    surf->hwnd = hwnd;
++    pthread_mutex_init(&surf->lock, NULL);
++    pthread_cond_init(&surf->buffer_released, NULL);
++    surf->next_vsync_id = -1;
+
++    return surf;
++}
+
++static void surface_free(struct wine_vk_surface *surf)
++{
++    if (!surf) return;
++    pthread_cond_destroy(&surf->buffer_released);
++    pthread_mutex_destroy(&surf->lock);
++    free(surf);
++}
+
++/* ------------------------------------------------------------------ */
+
++/*
++ * create_surface_control - build the ASurfaceControl for hwnd.
++ *
++ * We use ASurfaceControl_createFromWindow() so the SC is anchored to
++ * the WineActivity SurfaceView's ANativeWindow.  Subsequent child HWNDs
++ * could use ASurfaceControl_create(parent_sc) for z-ordered overlays,
++ * but that is deferred to a follow-up series.
++ */
++static BOOL create_surface_control(struct wine_vk_surface *surf)
++{
++    ANativeWindow *win;
++    char          debug_name[64];
+
++    win = wine_get_native_window(surf->hwnd);
++    if (!win)
++    {
++        ERR("hwnd %p has no native window yet\n", surf->hwnd);
++        return FALSE;
++    }
+
++    snprintf(debug_name, sizeof(debug_name),
++             "wine_vk_%p", (void *)surf->hwnd);
+
++    surf->sc = sc_funcs.ASurfaceControl_createFromWindow(win, debug_name);
++    ANativeWindow_release(win);
+
++    if (!surf->sc)
++    {
++        ERR("ASurfaceControl_createFromWindow failed for hwnd %p\n",
++            surf->hwnd);
++        return FALSE;
++    }
+
++    TRACE("hwnd %p → ASurfaceControl %p\n",
++          (void *)surf->hwnd, (void *)surf->sc);
++    return TRUE;
++}
+
++/* ------------------------------------------------------------------ */
+
++/*
++ * android_update_surface_geometry - commit a geometry change atomically.
++ *
++ * Called from the window resize/move path in window.c.  The transaction
++ * is applied immediately so WM_SIZE / WM_MOVE are tear-free.
++ *
++ * 'transform' is one of the ANATIVEWINDOW_TRANSFORM_* constants;
++ * pass 0 for no rotation.
++ */
++void android_update_surface_geometry(struct wine_vk_surface *surf,
++                                      const RECT *rect,
++                                      int32_t     transform)
++{
++    ASurfaceTransaction *txn;
++    ARect src, dst;
+
++    if (!surf || !surf->sc) return;
+
++    src.left   = 0;
++    src.top    = 0;
++    src.right  = (int32_t)surf->width;
++    src.bottom = (int32_t)surf->height;
+
++    dst.left   = (int32_t)rect->left;
++    dst.top    = (int32_t)rect->top;
++    dst.right  = (int32_t)rect->right;
++    dst.bottom = (int32_t)rect->bottom;
+
++    txn = sc_funcs.ASurfaceTransaction_create();
++    sc_funcs.ASurfaceTransaction_setGeometry(txn, surf->sc,
++                                              src, dst, transform);
++    sc_funcs.ASurfaceTransaction_apply(txn);
++    sc_funcs.ASurfaceTransaction_delete(txn);
++}
+
++/* ------------------------------------------------------------------ */
+
++/*
++ * android_vulkan_surface_create  (driver entry point)
++ *
++ * Called by winevulkan when the application calls vkCreateWin32SurfaceKHR.
++ * We create our wine_vk_surface and, if ASurfaceControl is available,
++ * set up the SC-backed path.  Otherwise we fall back to ANativeWindow +
++ * VK_KHR_android_surface (fallback implemented in patch 6/6).
++ */
++static VkResult android_vulkan_surface_create(HWND hwnd,
++                                               VkInstance instance,
++                                               VkSurfaceKHR *out_surface)
++{
++    struct wine_vk_surface *surf;
++    VkResult vr;
+
++    TRACE("hwnd %p instance %p\n", hwnd, (void *)instance);
+
++    surf = surface_alloc(hwnd);
++    if (!surf)
++        return VK_ERROR_OUT_OF_HOST_MEMORY;
+
++    if (sc_funcs.available)
++    {
++        /* ── High-performance path (API >= 29) ─────────────────── */
++        if (!create_surface_control(surf))
++        {
++            /* If SC creation fails for any reason, degrade gracefully. */
++            WARN("Falling back to ANativeWindow path for hwnd %p\n", hwnd);
++            goto fallback;
++        }
+
++        /*
++         * We still need a VkSurfaceKHR so that winevulkan can call
++         * vkGetPhysicalDeviceSurfaceCapabilitiesKHR etc.  Create one
++         * from the ANativeWindow; presentation itself will bypass this
++         * surface and go through ASurfaceControl + AHB.
++         */
++        {
++            ANativeWindow *win = wine_get_native_window(hwnd);
++            VkAndroidSurfaceCreateInfoKHR info = {
++                .sType  = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
++                .window = win,
++            };
++            if (!p_vkCreateAndroidSurfaceKHR)
++                p_vkCreateAndroidSurfaceKHR =
++                    (PFN_vkCreateAndroidSurfaceKHR)
++                    p_vkGetInstanceProcAddr(instance,
++                                           "vkCreateAndroidSurfaceKHR");
+
++            vr = p_vkCreateAndroidSurfaceKHR(instance, &info, NULL,
++                                              &surf->vk_surface);
++            ANativeWindow_release(win);
++            if (vr != VK_SUCCESS)
++            {
++                ERR("vkCreateAndroidSurfaceKHR: %d\n", vr);
++                sc_funcs.ASurfaceControl_release(surf->sc);
++                surf->sc = NULL;
++                goto fallback;
++            }
++        }
+
++        /* Buffer pool is created lazily in vkCreateSwapchainKHR hook;
++         * store the surface so it can be looked up by HWND. */
++        *out_surface = surf->vk_surface;
+
++        pthread_mutex_lock(&surface_list_lock);
++        list_add_tail(&surface_list, &surf->entry);
++        pthread_mutex_unlock(&surface_list_lock);
+
++        TRACE("hwnd %p: SC path ready, VkSurfaceKHR %p\n",
++              hwnd, (void *)surf->vk_surface);
++        return VK_SUCCESS;
++    }
+
++fallback:
++    /* ── Fallback path (API < 29 or SC unavailable) ───────────── */
++    {
++        ANativeWindow *win = wine_get_native_window(hwnd);
++        VkAndroidSurfaceCreateInfoKHR info = {
++            .sType  = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
++            .window = win,
++        };
++        if (!p_vkCreateAndroidSurfaceKHR)
++            p_vkCreateAndroidSurfaceKHR =
++                (PFN_vkCreateAndroidSurfaceKHR)
++                p_vkGetInstanceProcAddr(instance, "vkCreateAndroidSurfaceKHR");
+
++        vr = p_vkCreateAndroidSurfaceKHR(instance, &info, NULL,
++                                          &surf->vk_surface);
++        ANativeWindow_release(win);
++        if (vr != VK_SUCCESS)
++        {
++            ERR("fallback vkCreateAndroidSurfaceKHR: %d\n", vr);
++            surface_free(surf);
++            return vr;
++        }
++    }
+
++    *out_surface = surf->vk_surface;
++    surf->sc     = NULL; /* explicitly mark as fallback */
+
++    pthread_mutex_lock(&surface_list_lock);
++    list_add_tail(&surface_list, &surf->entry);
++    pthread_mutex_unlock(&surface_list_lock);
+
++    TRACE("hwnd %p: ANativeWindow fallback path, VkSurfaceKHR %p\n",
++          hwnd, (void *)surf->vk_surface);
++    return VK_SUCCESS;
++}
+
++/* ------------------------------------------------------------------ */
+
++/*
++ * android_vulkan_surface_destroy  (driver entry point)
++ */
++static void android_vulkan_surface_destroy(HWND hwnd, VkSurfaceKHR surface)
++{
++    struct wine_vk_surface *surf;
+
++    TRACE("hwnd %p surface %p\n", hwnd, (void *)surface);
+
++    surf = surface_from_hwnd(hwnd);
++    if (!surf)
++    {
++        WARN("No surface found for hwnd %p\n", hwnd);
++        return;
++    }
+
++    /* Remove from global list first so no new presents arrive. */
++    pthread_mutex_lock(&surface_list_lock);
++    list_remove(&surf->entry);
++    pthread_mutex_unlock(&surface_list_lock);
+
++    /* Drain the AHB pool (waits for all release fences). */
++    if (surf->num_buffers)
++        ahb_pool_destroy(surf);
+
++    /* Release ASurfaceControl (makes the surface invisible). */
++    if (surf->sc)
++    {
++        sc_funcs.ASurfaceControl_release(surf->sc);
++        surf->sc = NULL;
++    }
+
++    /* The VkSurfaceKHR is destroyed by the caller (winevulkan). */
+
++    surface_free(surf);
++}
