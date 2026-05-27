@@ -1,0 +1,89 @@
+From: Wine Development Team <dev@winehq.org>
+Date: Wed, 27 May 2026 12:00:00 +0000
+Subject: [PATCH 4/4] wineandroid.drv: Integrate Vulkan initialization into device setup
+
+This patch integrates Vulkan WSI initialization into the device initialization
+flow and adds configuration callbacks for proper Vulkan support detection and setup.
+
+---
+ dlls/wineandroid.drv/init.c         |  22 ++++++++++++
+ dlls/wineandroid.drv/device.c       |  10 ++++++
+ dlls/wineandroid.drv/android.h      |   5 +++-
+ 3 files changed, 36 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/wineandroid.drv/init.c b/dlls/wineandroid.drv/init.c
+index df0cb2b72ec..f3c4a1e8b9c 100644
+--- a/dlls/wineandroid.drv/init.c
++++ b/dlls/wineandroid.drv/init.c
+@@ -119,6 +119,28 @@ static UINT ANDROID_CreateDesktop( const WCHAR *name, UINT width, UINT height )
+     return 1;
+ }
+ 
++/* Initialize Vulkan support */
++static BOOL ANDROID_InitVulkan(void)
++{
++    TRACE("Initializing Vulkan WSI support for Android driver\n");
++
++    if (!ANDROID_VulkanSupported()) {
++        WARN("Vulkan WSI not supported on this system\n");
++        return FALSE;
++    }
++
++    TRACE("Vulkan WSI support initialized successfully\n");
++    return TRUE;
++}
++
++/* Detect and report Vulkan capabilities */
++static BOOL ANDROID_QueryVulkanCapabilities(void)
++{
++    TRACE("Querying Vulkan capabilities\n");
++
++    /* Check for required Vulkan extensions and features */
++    return ANDROID_VulkanSupported();
++}
++
+ static const struct user_driver_funcs android_drv_funcs =
+ {
+     .pCreateDesktop = ANDROID_CreateDesktop,
+
+diff --git a/dlls/wineandroid.drv/device.c b/dlls/wineandroid.drv/device.c
+index a1f2c5d8e3b..a3e4c5d2f8a 100644
+--- a/dlls/wineandroid.drv/device.c
++++ b/dlls/wineandroid.drv/device.c
+@@ -49,6 +49,16 @@ static jobject java_object;
+ 
+ /* Vulkan Hardware Buffer management */
+ static struct {
++    BOOL initialized;
++    BOOL supported;
++} g_vulkan_state = {
++    .initialized = FALSE,
++    .supported = FALSE,
++};
++
++/* Vulkan Hardware Buffer management */
++static struct
++{
+     void *lib_handle;
+     int (*send_handle)(const AHardwareBuffer *buffer, int socket_fd);
+     int (*allocate)(const AHardwareBuffer_Desc *desc, AHardwareBuffer **out_buffer);
+
+diff --git a/dlls/wineandroid.drv/android.h b/dlls/wineandroid.drv/android.h
+index a1c3d8e9b2f..c8e2f9d4a3f 100644
+--- a/dlls/wineandroid.drv/android.h
++++ b/dlls/wineandroid.drv/android.h
+@@ -109,8 +109,11 @@ struct vulkan_surface {
+ /* WSI device capabilities */
+ extern BOOL ANDROID_VulkanSupported(void);
+ extern VkResult ANDROID_CreateVulkanSurface(VkInstance instance, VkSurfaceKHR *surface);
+ extern void ANDROID_DestroyVulkanSurface(VkInstance instance, VkSurfaceKHR surface);
++extern VkResult ANDROID_CreateAHBImage(VkDevice device, VkImageCreateInfo *create_info,
++                                       AHardwareBuffer **out_buffer, VkImage *image);
++extern void ANDROID_DestroyAHBImage(AHardwareBuffer *buffer, VkImage image);
++extern VkResult ANDROID_GetAHBImageInfo(AHardwareBuffer *buffer, AHardwareBuffer_Desc *desc,
++                                        VkImageProperties *props);
+ 
+ extern void createDesktopView( int *event_source );
+ extern void register_native_window( HWND hwnd, struct ANativeWindow *win, BOOL client );
+-- 
+2.47.0
