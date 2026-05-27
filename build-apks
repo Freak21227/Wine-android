@@ -273,7 +273,7 @@ apply_patches ()
                 (cd wine && patch -p1 < "$patchfile") || { echo "ERROR: $patchname failed to apply."; patch_errors=$((patch_errors + 1)); }
                 ;;
             *)
-                (cd wine && git apply "$patchfile") || { echo "ERROR: $patchname failed to apply."; patch_errors=$((patch_errors + 1)); }
+                (cd wine && git am "$patchfile") || { echo "ERROR: $patchname failed to apply."; patch_errors=$((patch_errors + 1)); }
                 ;;
         esac
     done
